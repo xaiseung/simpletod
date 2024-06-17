@@ -1,5 +1,6 @@
 
 import torch
+import tokenizers
 from transformers import GPT2Tokenizer, GPT2LMHeadModel, OpenAIGPTLMHeadModel, OpenAIGPTTokenizer
 from utils.args_parser import ArgsParser
 from data.dataset.multiwoz import MultiWozDataset
@@ -79,7 +80,7 @@ else:
 model.eval()
 model.to('cuda')
 
-break_tokens = tokenizer.encode(tokenizer._eos_token)
+break_tokens = tokenizer.encode("{}".format(tokenizer._eos_token))
 MAX_LEN = model.config.n_ctx
 
 
@@ -219,6 +220,7 @@ for i, dial_name in enumerate(lex_dict):
             # Predict all tokens
             with torch.no_grad():
                 #while predicted_index not in break_tokens:
+                truncate_action = False
                 while predicted_index not in break_tokens:
                     outputs = model(tokens_tensor)
                     predictions = outputs[0]
@@ -278,7 +280,7 @@ for i, dial_name in enumerate(lex_dict):
                     #     max_length=MAX_LEN,
                     #     do_sample=False
                     # )
-                    
+                    truncate_action = False
                     while predicted_index not in break_tokens:
                         outputs = model(tokens_tensor)
                         predictions = outputs[0]

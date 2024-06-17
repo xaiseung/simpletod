@@ -78,10 +78,10 @@ def get_model_tokenizer(args):
         )
 
     if args.block_size <= 0:
-        args.block_size = tokenizer.max_len
+        args.block_size = tokenizer.model_max_length
         # Our input block size will be the max possible for the model
     else:
-        args.block_size = min(args.block_size, tokenizer.max_len)
+        args.block_size = min(args.block_size, tokenizer.model_max_length)
 
     if args.model_name_or_path:
         model = model_class.from_pretrained(
@@ -187,7 +187,7 @@ def train_epoch(model, tokenizer, optimizer, scheduler, train_dataloader, tr_los
             # save checkpoint
             if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
                 if args.evaluate_during_training:
-                    save_checkpoint(model, optimizer, scheduler, tokenizer, args)
+                    save_checkpoint(model, optimizer, scheduler, tokenizer, args, global_step)
 
         if args.max_steps > 0 and global_step > args.max_steps:
             epoch_iterator.close()
@@ -225,7 +225,7 @@ def train(args, train_dataset, model, tokenizer):
         model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
 
     # multi-gpu training
-    if args.n_gpu > 1:
+    if args.n_gpu > 1 and not isinstance(model, torch.nn.DataParallel):
         model = torch.nn.DataParallel(model)
 
     # Distributed training
@@ -284,7 +284,7 @@ def evaluate(args, model, tokenizer, prefix=""):
     eval_dataloader, args = get_dataloader(eval_dataset, tokenizer, args, split='eval')
 
     # multi-gpu evaluate
-    if args.n_gpu > 1:
+    if args.n_gpu > 1 and not isinstance(model, torch.nn.DataParallel):
         model = torch.nn.DataParallel(model)
 
     # Eval!
@@ -396,6 +396,12 @@ def main():
                 os.path.dirname(c) for c in sorted(glob.glob(args.output_dir + "/**/" + WEIGHTS_NAME, recursive=True))
             )
             logging.getLogger("models.modeling_utils").setLevel(logging.WARN)  # Reduce logging
+        else:
+            last = -1
+            for ckpt in glob.glob(args.output_dir+"/checkpoint*"):
+                if last < os.path.getmtime(ckpt):
+                    last = os.path.getmtime(ckpt)
+                    checkpoints = [ckpt]
         logger.info("Evaluate the following checkpoints: {}".format(checkpoints))
 
         for checkpoint in checkpoints:

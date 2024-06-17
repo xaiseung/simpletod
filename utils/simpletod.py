@@ -62,7 +62,7 @@ def get_response(sent, tokenizer):
     tokens = tokenizer.encode(tmp)
     new_tokens = []
     for tok in tokens:
-        if tok in tokenizer.encode(tokenizer._eos_token):
+        if tok in tokenizer.encode("{}".format(tokenizer._eos_token)):
             continue
         new_tokens.append(tok)
     response = tokenizer.decode(new_tokens).strip(' ,.')
@@ -80,7 +80,7 @@ def get_response_openaigpt(sent, tokenizer):
     tokens = tokenizer.encode(tmp)
     new_tokens = []
     for tok in tokens:
-        if tok in tokenizer.encode(tokenizer._eos_token):
+        if tok in tokenizer.encode("{}".format(tokenizer._eos_token)):
             continue
         new_tokens.append(tok)
     response = tokenizer.decode(new_tokens).strip(' ,.')
@@ -183,7 +183,10 @@ def get_db_dynamically(predicted_text, goal, multiwoz_db):
                 domain_match_text = '<41'
             else:
                 domain_match_text = '>40'
-        if 'fail_book' in goal[dom]:
+        #it also can be fix by
+        #if 'fail_book' in goal[dom]:
+        #    domain_book_text = 'available'
+        if 'fail_book' in goal[dom] and len(goal[dom]['fail_book']) > 0:
             for item in goal[dom]['fail_book'].items():
                 if item in belief_book_domain[dom].items():
                     domain_book_text = 'not available'
