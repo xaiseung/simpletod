@@ -27,6 +27,9 @@ from transformers import (
     PreTrainedModel,
     PreTrainedTokenizer,
     # get_linear_schedule_with_warmup,
+    AutoConfig,
+    AutoTokenizer,
+    AutoModelForCausalLM,
 )
 
 from transformers import GPT2Tokenizer
@@ -58,7 +61,13 @@ MODEL_CLASSES = {
 
 
 def get_model_tokenizer(args):
-    config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
+    if args.model_type in MODEL_CLASSES:
+        config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
+    else:
+        assert args.model_name_or_path
+        config_class, model_class, tokenizer_class = AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+        
 
     if args.config_name:
         config = config_class.from_pretrained(args.config_name, cache_dir=args.cache_dir)
@@ -83,24 +92,36 @@ def get_model_tokenizer(args):
     else:
         args.block_size = min(args.block_size, tokenizer.model_max_length)
 
-    if args.model_name_or_path:
+    if args.model_type == "llama3":
         model = model_class.from_pretrained(
             args.model_name_or_path,
-            from_tf=bool(".ckpt" in args.model_name_or_path),
             config=config,
             cache_dir=args.cache_dir,
+            device_map="auto",
+            torch_dtype = torch.bfloat16,
         )
     else:
-        logger.info("Training new model from scratch")
-        model = model_class(config=config)
+        if args.model_name_or_path:
+            model = model_class.from_pretrained(
+                args.model_name_or_path,
+                from_tf=bool(".ckpt" in args.model_name_or_path),
+                config=config,
+                cache_dir=args.cache_dir,
+            )
+        else:
+            logger.info("Training new model from scratch")
+            model = model_class(config=config)
 
-    model.to(args.device)
+        model.to(args.device)
 
     if args.model_name_or_path == 'openai-gpt':
         tokenizer.add_special_tokens({'bos_token': '<|endoftext|>'})
         tokenizer.add_special_tokens({'eos_token': '<|endoftext|>'})
     elif args.model_name_or_path == 'gpt2':
         pass
+    else:
+        tokenizer.add_special_tokens({'bos_token': '<|endoftext|>'})
+        tokenizer.add_special_tokens({'eos_token': '<|endoftext|>'})
 
     return model, tokenizer, model_class, args
 
