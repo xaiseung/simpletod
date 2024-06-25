@@ -67,11 +67,14 @@ data_delex = MultiWozDataset(opt_delex, split=EVAL_SPLIT, shuffle=False)
 
 lex_dict = {}
 delex_dict = {}
+max_num = 20
 for d in data:
     lex_dict[d['name']] = d
+    if len(lex_dict) == max_num: break
 
 for d in data_delex:
     delex_dict[d['name']] = d
+    if len(delex_dict) == max_num: break
 
 if 'openai-gpt' in model_checkpoint:
     tokenizer = OpenAIGPTTokenizer.from_pretrained(model_checkpoint)
@@ -79,21 +82,26 @@ if 'openai-gpt' in model_checkpoint:
     tokenizer.add_special_tokens({'eos_token': '<|endoftext|>'})
 elif "llama" in model_checkpoint:
     tokenizer = AutoTokenizer.from_pretrained(model_checkpoint)
+    tokenizer.pad_token_id = tokenizer.eos_token_id
 else:
     tokenizer = GPT2Tokenizer.from_pretrained(model_checkpoint)
 
 if 'openai-gpt' in model_checkpoint:
     model = OpenAIGPTLMHeadModel.from_pretrained(model_checkpoint)
 elif "llama" in model_checkpoint:
-    model = AutoModelForCausalLM.from_pretrained(model_checkpoint)
+    model = AutoModelForCausalLM.from_pretrained(model_checkpoint,
+                                                 torch_dtype = torch.bfloat16,
+                                                 device_map="cuda:0")
 else:
     model = GPT2LMHeadModel.from_pretrained(model_checkpoint)
 
 model.eval()
-model.to('cuda')
+#model.to('cuda')
 
 break_tokens = tokenizer.encode("{}".format(tokenizer._eos_token))
-MAX_LEN = model.config.n_ctx
+# TODO: load max input length properly
+MAX_LEN = 1024 
+#MAX_LEN = model.config.n_ctx 
 
 
 generated_dict = {}
@@ -165,8 +173,10 @@ for i, dial_name in enumerate(lex_dict):
         
         if dial_name == 'SNG02319.json':
             tmp_text = tmp_text.replace('300 will', '03:00 will')
+        # TODO temp fix. i don't know why it happened but they started with `<|begin_of_text|><|begin_of_text|>`
+        #text = '{} <|context|> {} <|endofcontext|> '.format(tokenizer._bos_token, tmp_text)
+        text = ' <|context|> {} <|endofcontext|> '.format(tmp_text)
 
-        text = '{} <|context|> {} <|endofcontext|> '.format(tokenizer._bos_token, tmp_text)
 
         if USE_ORACLE_BELIEF:
             turn_belief = dialogue_target_belief[turn_id]
@@ -276,7 +286,8 @@ for i, dial_name in enumerate(lex_dict):
                         do_sample=True,
                         max_length=MAX_LEN,
                         top_p=0.5,
-                        top_k=0
+                        top_k=0,
+                        pad_token_id = tokenizer.eos_token_id,
                     )
                     predicted_text = tokenizer.decode(sample_output[0])
                     tmp = ' '.join([predicted_text.split('<|endofresponse|>')[0], '<|endofresponse|>'])
@@ -336,7 +347,6 @@ for i, dial_name in enumerate(lex_dict):
     dialogue_pred_belief = []
     dialogue_pred_responses = []
     dialogue_pred_action = []
-
     # aggregate belief states
     for turn, pred in enumerate(generated):
         turn_pred_belief = []

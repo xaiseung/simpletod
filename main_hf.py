@@ -11,7 +11,7 @@ import pickle
 import random
 import re
 # import shutil
-# from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -22,7 +22,7 @@ from tqdm import tqdm, trange
 
 from transformers import (
     WEIGHTS_NAME,
-    # AdamW,
+    AdamW,
     GPT2Tokenizer,
     PreTrainedModel,
     PreTrainedTokenizer,
@@ -30,9 +30,14 @@ from transformers import (
     AutoConfig,
     AutoTokenizer,
     AutoModelForCausalLM,
+    BitsAndBytesConfig,
+    DataCollatorWithPadding,
+    get_linear_schedule_with_warmup,
 )
 
-from transformers import GPT2Tokenizer
+from trl import SFTTrainer, SFTConfig
+from peft import LoraConfig, get_peft_model
+import datasets
 
 # comment this if you want to load gpt2 class from transformers
 from models import GPT2LMHeadModel
@@ -95,13 +100,23 @@ def get_model_tokenizer(args):
         args.block_size = min(args.block_size, tokenizer.model_max_length)
 
     if args.model_type == "llama3":
+        # TODO: Add args for Quantization
+        #bnb_config = BitsAndBytesConfig(
+        #    load_in_4bit=True,
+        #    bnb_4bit_use_double_quant=True,
+        #    bnb_4bit_quant_type="nf4",
+        #    bnb_4bit_compute_dtype=torch.bfloat16
+        #)
         model = model_class.from_pretrained(
             args.model_name_or_path,
             config=config,
             cache_dir=args.cache_dir,
             device_map="auto",
             torch_dtype = torch.bfloat16,
+            #quantization_config=bnb_config
         )
+        tokenizer.model_max_length = args.block_size
+        tokenizer.pad_token = tokenizer.eos_token
     else:
         if args.model_name_or_path:
             model = model_class.from_pretrained(
@@ -121,9 +136,6 @@ def get_model_tokenizer(args):
         tokenizer.add_special_tokens({'eos_token': '<|endoftext|>'})
     elif args.model_name_or_path == 'gpt2':
         pass
-    else:
-        tokenizer.add_special_tokens({'bos_token': '<|endoftext|>'})
-        tokenizer.add_special_tokens({'eos_token': '<|endoftext|>'})
 
     return model, tokenizer, model_class, args
 
@@ -218,135 +230,260 @@ def train_epoch(model, tokenizer, optimizer, scheduler, train_dataloader, tr_los
 
     return model, optimizer, scheduler, global_step, tr_loss, logging_loss
 
+def get_num_layers(model):
+    numbers = set()
+    for name, _ in model.named_parameters():
+        for number in re.findall(r'\d+', name):
+            numbers.add(int(number))
+    return max(numbers)
 
-def train(args, train_dataset, model, tokenizer):
-    """ Train the model """
-    if args.local_rank in [-1, 0]:
-        tb_writer = SummaryWriter('./runs/{}'.format(args.output_dir.split('/')[-1]))
+def get_last_layer_linears(model):
+    names = []
+    
+    num_layers = get_num_layers(model)
+    for name, module in model.named_modules():
+        if str(num_layers) in name and not "encoder" in name:
+            if isinstance(module, torch.nn.Linear):
+                names.append(name)
+    return names
 
-    # Prepare dataloader
-    train_dataloader, args = get_dataloader(train_dataset, tokenizer, args)
+class CustomCollator(DataCollatorWithPadding):
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+        batch = super().__call__(features)
+        batch["labels"] = batch["input_ids"]
+        return batch
 
+CUSTOM_TRAINER_OUTPUT_DIR = "./"
+class CustomTrainer(SFTTrainer):
+    def evaluate(self, *args, **kwargs):
+        result = super().evaluate(*args, **kwargs)
+
+        output_eval_file = os.path.join(CUSTOM_TRAINER_OUTPUT_DIR, "eval_results.txt")
+        with open(output_eval_file, "w") as writer:
+            logger.info("***** Eval results {} *****".format(""))
+            for key in sorted(result.keys()):
+                logger.info("  %s = %s", key, str(result[key]))
+                writer.write("%s = %s\n" % (key, str(result[key])))
+        logger.info(f"")
+        for l in self.state.log_history:
+            logger.info(f"{l}")
+        return result
+
+def train(args, tokenized_datasets, model, tokenizer):
+    global CUSTOM_TRAINER_OUTPUT_DIR
     # total iteration and batch size
     if args.max_steps > 0:
         t_total = args.max_steps
-        args.num_train_epochs = args.max_steps // (len(train_dataloader) // args.gradient_accumulation_steps) + 1
+        args.num_train_epochs = args.max_steps // (len(tokenized_datasets["train"]) // args.gradient_accumulation_steps) + 1
     else:
-        t_total = len(train_dataloader) // args.gradient_accumulation_steps * args.num_train_epochs
+        t_total = len(tokenized_datasets["train"]) // args.gradient_accumulation_steps * args.num_train_epochs
 
-    total_batch_size = args.train_batch_size * args.gradient_accumulation_steps * (
+    total_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu) * args.gradient_accumulation_steps * (
         torch.distributed.get_world_size() if args.local_rank != -1 else 1)
 
     # Prepare optimizer and schedule (linear warmup and decay)
     optimizer, scheduler = get_optimizer_scheduler(args, model, t_total)
 
-    if args.fp16:
-        try:
-            from apex import amp
-        except ImportError:
-            raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
-        model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
+    #if args.fp16:
+    #    try:
+    #        from apex import amp
+    #    except ImportError:
+    #        raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
+    #    model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
+    ## multi-gpu training
+    #if args.n_gpu > 1 and not isinstance(model, torch.nn.DataParallel):
+    #    model = torch.nn.DataParallel(model)
 
-    # multi-gpu training
-    if args.n_gpu > 1 and not isinstance(model, torch.nn.DataParallel):
-        model = torch.nn.DataParallel(model)
-
-    # Distributed training
-    if args.local_rank != -1:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True
-        )
+    ## Distributed training
+    #if args.local_rank != -1:
+    #    model = torch.nn.parallel.DistributedDataParallel(
+    #        model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True
+    #    )
 
     # Train!
     logger.info("***** Running training *****")
-    logger.info("  Num examples = {}".format(len(train_dataset)))
+    logger.info("  Num examples = {}".format(len(tokenized_datasets["train"])))
     logger.info("  Num Epochs = {}".format(args.num_train_epochs))
     logger.info("  Instantaneous batch size per GPU = {}".format(args.per_gpu_train_batch_size))
     logger.info("  Total train batch size (w. parallel, distributed & accumulation) = {}".format(total_batch_size))
     logger.info("  Gradient Accumulation steps = {}".format(args.gradient_accumulation_steps))
     logger.info("  Total optimization steps = {}".format(t_total))
 
-    global_step, epochs_trained, steps_trained_in_current_epoch = get_training_info(train_dataloader, args)
+    # is it really unnessasary? I'm scared to delete this, so I make it as comment and leave it.
+    #global_step, epochs_trained, steps_trained_in_current_epoch = get_training_info(tokenized_datasets["train"], args)
 
-    tr_loss, logging_loss = 0.0, 0.0
 
     model_to_resize = model.module if hasattr(model, "module") else model  # Take care of distributed/parallel training
     model_to_resize.resize_token_embeddings(len(tokenizer))
 
+    model.train()
     model.zero_grad()
+    
+    # TODO: remove below commented code
+    #train_iterator = trange(
+    #    epochs_trained, int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0]
+    #)
+    #for _ in train_iterator:
+    #    model, optimizer, scheduler, global_step, tr_loss, logging_loss = train_epoch(model, tokenizer, optimizer, scheduler, train_dataloader, tr_loss, logging_loss, global_step,
+    #                              steps_trained_in_current_epoch, tb_writer, args)
+    #    if args.max_steps > 0 and global_step > args.max_steps:
+    #        train_iterator.close()
+    #        break
+    #if args.local_rank in [-1, 0]:
+    #    tb_writer.close()
 
-    train_iterator = trange(
-        epochs_trained, int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0]
+
+    data_collator = CustomCollator(tokenizer=tokenizer, return_tensors="pt")
+
+    training_args = SFTConfig(
+        output_dir=args.output_dir,
+        do_eval=args.evaluate_during_training,
+        evaluation_strategy="steps",
+        logging_steps=args.logging_steps,
+        eval_steps=args.logging_steps,
+        save_steps=args.save_steps,
+        num_train_epochs=args.num_train_epochs,
+        per_device_train_batch_size=args.per_gpu_train_batch_size,
+        per_device_eval_batch_size=args.per_gpu_eval_batch_size,
+        #bf16=True,
+        #bf16_full_eval=True,
+        max_seq_length = args.block_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
     )
+    # TODO: add arg to argparser for peft config
+    #  - more option for target_modules outta 'last layer'
+    linears_last_layer = get_last_layer_linears(model)
+    if len(linears_last_layer) == 0:
+        linears_last_layer = None
+    
+    peft_config= None
+    if args.use_lora:
+        peft_config = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            #target_modules=linears_last_layer,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, peft_config)
+        lora_layers = filter(lambda p: p.requires_grad, model.parameters())
 
-    for _ in train_iterator:
 
-        model, optimizer, scheduler, global_step, tr_loss, logging_loss = train_epoch(model, tokenizer, optimizer, scheduler, train_dataloader, tr_loss, logging_loss, global_step,
-                                  steps_trained_in_current_epoch, tb_writer, args)
+        # Prepare optimizer and schedule (linear warmup and decay)
+        #optimizer, scheduler = get_optimizer_scheduler(args, model, t_total)
+        optimizer = AdamW(
+            lora_layers,
+            lr=args.learning_rate,
+            eps=args.adam_epsilon,
+            weight_decay=args.weight_decay,
+            )
+        scheduler = get_linear_schedule_with_warmup(
+                optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=t_total
+            )
+    CUSTOM_TRAINER_OUTPUT_DIR = args.output_dir
+    trainer = CustomTrainer(
+        model=model,
+        args=training_args,
+        data_collator=data_collator,
+        train_dataset=tokenized_datasets["train"],
+        eval_dataset=tokenized_datasets["eval"],
+        tokenizer=tokenizer,
+        optimizers=(optimizer, scheduler),
+        peft_config=peft_config,
+    )
+    train_output = trainer.train()
 
-        if args.max_steps > 0 and global_step > args.max_steps:
-            train_iterator.close()
-            break
-
-    if args.local_rank in [-1, 0]:
-        tb_writer.close()
-
-    return global_step, tr_loss / global_step
+    return train_output.global_step, train_output.training_loss
 
 
-def evaluate(args, model, tokenizer, prefix=""):
+def evaluate(args, model, tokenizer, prefix="", tokenized_datasets=None):
     # Loop to handle MNLI double evaluation (matched, mis-matched)
     eval_output_dir = args.output_dir
 
-    eval_dataset = load_and_cache_examples(args, tokenizer, evaluate=True)
+    #eval_dataset = load_and_cache_examples(args, tokenizer, evaluate=True)
 
     if args.local_rank in [-1, 0]:
         os.makedirs(eval_output_dir, exist_ok=True)
 
-    # Prepare dataloader
-    eval_dataloader, args = get_dataloader(eval_dataset, tokenizer, args, split='eval')
+    if tokenized_datasets is None:
+        raw_datasets = datasets.load_dataset(
+            "text",
+            data_files={"eval":args.eval_data_file})
+        def tokenize_fn(example):
+            be = tokenizer(example["text"], truncation=True)
+            return be
 
-    # multi-gpu evaluate
-    if args.n_gpu > 1 and not isinstance(model, torch.nn.DataParallel):
-        model = torch.nn.DataParallel(model)
+        tokenized_datasets = raw_datasets.map(tokenize_fn, batched=True)
+        tokenized_datasets = tokenized_datasets.remove_columns(["text"])
+        tokenized_datasets.set_format("torch")
+
+    # Prepare dataloader
+    #eval_dataloader, args = get_dataloader(eval_dataset, tokenizer, args, split='eval')
+
+    ## multi-gpu evaluate
+    #if args.n_gpu > 1 and not isinstance(model, torch.nn.DataParallel):
+    #    model = torch.nn.DataParallel(model)
 
     # Eval!
     logger.info("***** Running evaluation {} *****".format(prefix))
-    logger.info("  Num examples = {}".format(len(eval_dataset)))
-    logger.info("  Batch size = {}".format(args.eval_batch_size))
+    logger.info("  Num examples = {}".format(len(tokenized_datasets["eval"])))
+    logger.info("  Batch size = {}".format(args.per_gpu_eval_batch_size * max(1, args.n_gpu)))
     eval_loss = 0.0
     nb_eval_steps = 0
     model.eval()
 
-    for batch in tqdm(eval_dataloader, desc="Evaluating"):
-        inputs, labels = (batch, batch)
-        inputs = inputs.to(args.device)
-        labels = labels.to(args.device)
+    data_collator = CustomCollator(tokenizer=tokenizer, return_tensors="pt")
 
-        with torch.no_grad():
-            outputs = model(inputs, labels=labels)
-            lm_loss = outputs[0]
-            eval_loss += lm_loss.mean().item()
-        nb_eval_steps += 1
+    training_args = SFTConfig(
+        output_dir=args.output_dir,
+        do_train=False,
+        do_eval=True,
+        per_device_eval_batch_size=args.per_gpu_eval_batch_size,
+        #bf16=True,
+        #bf16_full_eval=True,
+        max_seq_length = args.block_size,
+    )
+    # TODO: add arg to argparser for peft config
+    #  - more option for target_modules outta 'last layer'
+    linears_last_layer = get_last_layer_linears(model)
+    if len(linears_last_layer) == 0:
+        linears_last_layer = None 
 
-    eval_loss = eval_loss / nb_eval_steps
-    perplexity = torch.exp(torch.tensor(eval_loss))
+    trainer = CustomTrainer(
+        model=model,
+        args=training_args,
+        data_collator=data_collator,
+        #train_dataset=tokenized_datasets["train"],
+        eval_dataset=tokenized_datasets["test"],
+        tokenizer=tokenizer,
+        #optimizers=(optimizer, scheduler),
+        #peft_config=peft_config,
+    )
+    eval_output = trainer.evaluate()
 
-    result = {"perplexity": perplexity}
 
-    output_eval_file = os.path.join(eval_output_dir, prefix, "eval_results.txt")
-    with open(output_eval_file, "w") as writer:
-        logger.info("***** Eval results {} *****".format(prefix))
-        for key in sorted(result.keys()):
-            logger.info("  %s = %s", key, str(result[key]))
-            writer.write("%s = %s\n" % (key, str(result[key])))
+    result = {"eval_loss": eval_output.eval_loss}
+
+    # # TODO: remove it, it was already wrote by CustomTrainer
+    #output_eval_file = os.path.join(eval_output_dir, prefix, "eval_results.txt")
+    #with open(output_eval_file, "w") as writer:
+    #    logger.info("***** Eval results {} *****".format(prefix))
+    #    for key in sorted(result.keys()):
+    #        logger.info("  %s = %s", key, str(result[key]))
+    #        writer.write("%s = %s\n" % (key, str(result[key])))
 
     return result
 
 
 def main():
-
-    args = ArgsParser().parse()
+    parser = ArgsParser()
+    parser.parser.add_argument("--use_lora", action="store_true", help="Training LLM with Low-Rank Adaptation")
+    parser.parser.add_argument("--lora_r", type=int, default=8, help="Dimension of adapter in LoRA")
+    parser.parser.add_argument("--lora_alpha", type=float, default=8.0, help="Adapter scaler Alpha for LoRA")
+    parser.parser.add_argument("--lora_dropout", type=float, default=0.1, help="Dropout rate of LoRA Adapter.")
+    
+    args = parser.parse()
 
     if args.eval_data_file is None and args.do_eval:
         raise ValueError(
@@ -396,17 +533,38 @@ def main():
 
     logger.info("Training/evaluation parameters {}".format(args))
 
+    
+    tokenized_datasets = None
     # Training
     if args.do_train:
         if args.local_rank not in [-1, 0]:
             torch.distributed.barrier()  # only first process will preprocess data/caching
+        # TODO: support for datasets `shuffling something`
+        #train_dataset = load_and_cache_examples(args, tokenizer, evaluate=False)
+        raw_datasets = datasets.load_dataset(
+            "text",
+            data_files={"train":args.train_data_file,
+                        "test":args.eval_data_file}
+            )
+        rnd_idx = np.arange(len(
+            raw_datasets["test"]))
+        np.random.shuffle(rnd_idx)
+        # TODO: make args for eval set size
+        desired_idx = set(rnd_idx[:400])
+        raw_datasets["eval"] = raw_datasets["test"].filter(lambda example, idx: idx in desired_idx, with_indices=True)
 
-        train_dataset = load_and_cache_examples(args, tokenizer, evaluate=False)
+        def tokenize_fn(example):
+            be = tokenizer(example["text"], truncation=True)
+            return be
+
+        tokenized_datasets = raw_datasets.map(tokenize_fn, batched=True)
+        tokenized_datasets = tokenized_datasets.remove_columns(["text"])
+        tokenized_datasets.set_format("torch")
 
         if args.local_rank == 0:
             torch.distributed.barrier() # end of barrier
 
-        global_step, train_loss = train(args, train_dataset, model, tokenizer)
+        global_step, train_loss = train(args, tokenized_datasets, model, tokenizer)
         logger.info(" global_step = {}, average loss = {}".format(global_step, train_loss))
 
     # Evaluation
@@ -433,7 +591,7 @@ def main():
 
             model = model_class.from_pretrained(checkpoint)
             model.to(args.device)
-            result = evaluate(args, model, tokenizer, prefix=prefix)
+            result = evaluate(args, model, tokenizer, prefix=prefix, tokenized_datasets=tokenized_datasets)
             result = dict((k + "_{}".format(global_step), v) for k, v in result.items())
             results.update(result)
 

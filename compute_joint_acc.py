@@ -16,6 +16,8 @@ parser.add_argument('--default_cleaning', action='store_true',
 parser.add_argument('--type2_cleaning', action='store_true',
                     help='use type 2 cleaning, refer to [https://arxiv.org/abs/2005.00796]')
 
+args = parser.parse_args()
+
 data = json.load(open(args.eval_file, 'r'))
 
 num_turns = 0
@@ -62,7 +64,8 @@ for dial in data:
                     break
             if flag:
                 for bs in turn_pred:
-                    if bs not in dialogue_target_final:
+                    #if bs not in dialogue_target_final:
+                    if bs not in dialogue_target:
                         flag = False
                         break
 

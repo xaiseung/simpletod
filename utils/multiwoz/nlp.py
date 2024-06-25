@@ -9,6 +9,7 @@ pricepat = re.compile("\d{1,3}[.]\d{1,2}")
 
 
 # fin = file('utils/mapping.pair')
+#fin = open('./mapping.pair')
 fin = open('utils/multiwoz/mapping.pair')
 replacements = []
 for line in fin.readlines():

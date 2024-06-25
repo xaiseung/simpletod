@@ -10,7 +10,7 @@ from transformers import (
 
 
 def get_optimizer_scheduler(args, model, t_total):
-    no_decay = ["bias", "LayerNorm.weight"]
+    no_decay = ["bias", "LayerNorm.weight", "layernorm.weight"]
     optimizer_grouped_parameters = [
         {
             "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],

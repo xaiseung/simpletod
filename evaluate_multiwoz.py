@@ -253,11 +253,11 @@ class MultiWozEvaluator(BaseEvaluator):
     def __init__(self, data_name):
         self.data_name = data_name
         self.slot_dict = delex.prepareSlotValuesIndependent()
-        self.delex_dialogues = json.load(open('resources/multi-woz-2.1/delex.json', 'r'))
+        self.delex_dialogues = json.load(open('resources/multi-woz/delex.json', 'r'))
         self.db = MultiWozDB()
         self.labels = list()
         self.hyps = list()
-        self.venues = json.load(open('resources/all_venues.json', 'r'))
+        #self.venues = json.load(open('resources/all_venues.json', 'r'))
 
     def add_example(self, ref, hyp):
         self.labels.append(ref)
@@ -379,8 +379,8 @@ class MultiWozEvaluator(BaseEvaluator):
                         if domain + '_' + requestable + ']' in sent_gpt:
                             provided_requestables[domain].append(requestable)
 
-            # print('venues', venue_offered)
-            # print('request', provided_requestables)
+            print('venues', venue_offered)
+            print('request', provided_requestables)
 
         # if name was given in the task
         for domain in goal.keys():
@@ -833,7 +833,7 @@ if __name__ == '__main__':
 
     eval_filename = sys.argv[1]
     # with open("resources/test_dials_2.1_lexicalized.json", "r") as f:
-    with open("resources/test_dials_2.1.json", "r") as f:
+    with open("resources/test_dials.json", "r") as f:
         human_raw_data = json.load(f)
     human_proc_data = {}
     for key, value in human_raw_data.items():
