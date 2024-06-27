@@ -162,74 +162,6 @@ def get_training_info(dataloader, args):
             logger.info("  Starting fine-tuning.")
     return global_step, epochs_trained, steps_trained_in_current_epoch
 
-
-
-def train_epoch(model, tokenizer, optimizer, scheduler, train_dataloader, tr_loss, logging_loss, global_step, steps_trained_in_current_epoch, tb_writer, args):
-    """train one epoch"""
-    if args.fp16:
-        try:
-            from apex import amp
-        except ImportError:
-            raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
-
-    epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
-    for step, batch in enumerate(epoch_iterator):
-
-        # Skip past any already trained steps if resuming training
-        if steps_trained_in_current_epoch > 0:
-            steps_trained_in_current_epoch -= 1
-            continue
-
-        inputs, labels = (batch, batch)
-        inputs = inputs.to(args.device)
-        labels = labels.to(args.device)
-        model.train()
-        outputs = model(inputs, labels=labels)
-        loss = outputs[0]  # model outputs are always tuple in transformers (see doc)
-
-        if args.n_gpu > 1:
-            loss = loss.mean()  # mean() to average on multi-gpu parallel training
-        if args.gradient_accumulation_steps > 1:
-            loss = loss / args.gradient_accumulation_steps
-
-        if args.fp16:
-            with amp.scale_loss(loss, optimizer) as scaled_loss:
-                scaled_loss.backward()
-        else:
-            loss.backward()
-
-        tr_loss += loss.item()
-        if (step + 1) % args.gradient_accumulation_steps == 0:
-            if args.fp16:
-                torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
-            else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-            optimizer.step()
-            scheduler.step()  # Update learning rate schedule
-            model.zero_grad()
-            global_step += 1
-
-            # Log metrics
-            if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
-                if (args.local_rank == -1 and args.evaluate_during_training):  # Only evaluate when single GPU otherwise metrics may not average well
-                    results = evaluate(args, model, tokenizer)
-                    for key, value in results.items():
-                        tb_writer.add_scalar("eval_{}".format(key), value, global_step)
-                tb_writer.add_scalar("lr", scheduler.get_lr()[0], global_step)
-                tb_writer.add_scalar("loss", (tr_loss - logging_loss) / args.logging_steps, global_step)
-                logging_loss = tr_loss
-
-            # save checkpoint
-            if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
-                if args.evaluate_during_training:
-                    save_checkpoint(model, optimizer, scheduler, tokenizer, args, global_step)
-
-        if args.max_steps > 0 and global_step > args.max_steps:
-            epoch_iterator.close()
-            break
-
-    return model, optimizer, scheduler, global_step, tr_loss, logging_loss
-
 def get_num_layers(model):
     numbers = set()
     for name, _ in model.named_parameters():
@@ -309,29 +241,11 @@ def train(args, tokenized_datasets, model, tokenizer):
     logger.info("  Gradient Accumulation steps = {}".format(args.gradient_accumulation_steps))
     logger.info("  Total optimization steps = {}".format(t_total))
 
-    # is it really unnessasary? I'm scared to delete this, so I make it as comment and leave it.
-    #global_step, epochs_trained, steps_trained_in_current_epoch = get_training_info(tokenized_datasets["train"], args)
-
-
     model_to_resize = model.module if hasattr(model, "module") else model  # Take care of distributed/parallel training
     model_to_resize.resize_token_embeddings(len(tokenizer))
 
     model.train()
     model.zero_grad()
-    
-    # TODO: remove below commented code
-    #train_iterator = trange(
-    #    epochs_trained, int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0]
-    #)
-    #for _ in train_iterator:
-    #    model, optimizer, scheduler, global_step, tr_loss, logging_loss = train_epoch(model, tokenizer, optimizer, scheduler, train_dataloader, tr_loss, logging_loss, global_step,
-    #                              steps_trained_in_current_epoch, tb_writer, args)
-    #    if args.max_steps > 0 and global_step > args.max_steps:
-    #        train_iterator.close()
-    #        break
-    #if args.local_rank in [-1, 0]:
-    #    tb_writer.close()
-
 
     data_collator = CustomCollator(tokenizer=tokenizer, return_tensors="pt")
 
@@ -362,7 +276,7 @@ def train(args, tokenized_datasets, model, tokenizer):
             r=args.lora_r,
             lora_alpha=args.lora_alpha,
             lora_dropout=args.lora_dropout,
-            #target_modules=linears_last_layer,
+            target_modules=linears_last_layer,
             bias="none",
             task_type="CAUSAL_LM",
         )
@@ -392,7 +306,7 @@ def train(args, tokenized_datasets, model, tokenizer):
         optimizers=(optimizer, scheduler),
         peft_config=peft_config,
     )
-    train_output = trainer.train()
+    train_output = trainer.train(resume_from_checkpoint=args.should_continue)
 
     return train_output.global_step, train_output.training_loss
 
@@ -418,13 +332,6 @@ def evaluate(args, model, tokenizer, prefix="", tokenized_datasets=None):
         tokenized_datasets = tokenized_datasets.remove_columns(["text"])
         tokenized_datasets.set_format("torch")
 
-    # Prepare dataloader
-    #eval_dataloader, args = get_dataloader(eval_dataset, tokenizer, args, split='eval')
-
-    ## multi-gpu evaluate
-    #if args.n_gpu > 1 and not isinstance(model, torch.nn.DataParallel):
-    #    model = torch.nn.DataParallel(model)
-
     # Eval!
     logger.info("***** Running evaluation {} *****".format(prefix))
     logger.info("  Num examples = {}".format(len(tokenized_datasets["eval"])))
@@ -444,34 +351,17 @@ def evaluate(args, model, tokenizer, prefix="", tokenized_datasets=None):
         #bf16_full_eval=True,
         max_seq_length = args.block_size,
     )
-    # TODO: add arg to argparser for peft config
-    #  - more option for target_modules outta 'last layer'
-    linears_last_layer = get_last_layer_linears(model)
-    if len(linears_last_layer) == 0:
-        linears_last_layer = None 
 
     trainer = CustomTrainer(
         model=model,
         args=training_args,
         data_collator=data_collator,
-        #train_dataset=tokenized_datasets["train"],
         eval_dataset=tokenized_datasets["test"],
         tokenizer=tokenizer,
-        #optimizers=(optimizer, scheduler),
-        #peft_config=peft_config,
     )
     eval_output = trainer.evaluate()
 
-
     result = {"eval_loss": eval_output.eval_loss}
-
-    # # TODO: remove it, it was already wrote by CustomTrainer
-    #output_eval_file = os.path.join(eval_output_dir, prefix, "eval_results.txt")
-    #with open(output_eval_file, "w") as writer:
-    #    logger.info("***** Eval results {} *****".format(prefix))
-    #    for key in sorted(result.keys()):
-    #        logger.info("  %s = %s", key, str(result[key]))
-    #        writer.write("%s = %s\n" % (key, str(result[key])))
 
     return result
 
@@ -493,8 +383,6 @@ def main():
         sorted_checkpoints = _sorted_checkpoints(args)
         if len(sorted_checkpoints) == 0:
             raise ValueError("--should_continue is true, but no checkpoint found in --output_dir")
-        else:
-            args.model_name_or_path = sorted_checkpoints[-1]
 
     # Setup CUDA, GPU & distributed training
     if args.local_rank == -1 or args.no_cuda:
