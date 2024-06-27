@@ -9,6 +9,7 @@ from transformers import (
     AutoConfig,
     AutoTokenizer,
     AutoModelForCausalLM,
+    GenerationConfig,
 )
 from utils.args_parser import ArgsParser
 from data.dataset.multiwoz import MultiWozDataset
@@ -20,6 +21,7 @@ import json
 import ipdb
 import sys
 import os
+import re
 
 
 
@@ -42,6 +44,7 @@ USE_DB_SEARCH = opt.use_db_search
 USE_DYNAMIC_DB = opt.use_dynamic_db
 # EVAL_SPLIT = 'test'
 EVAL_SPLIT = opt.split_set
+FASTGEN_OUTPUT_LEN = 192
 
 decoding = opt.decoding
 
@@ -54,6 +57,7 @@ multiwoz_data = json.load(open('resources/multi-woz/lex.json','r'))
 # model_checkpoint = '../dialog-transformer/output/{}/{}/'.format(exp_name, checkpoint)
 model_checkpoint = opt.checkpoint
 exp_name = os.path.split(model_checkpoint)[0].split('/')[-2]
+print(exp_name)
 
 multiwoz_db = MultiWozDB()
 
@@ -67,14 +71,14 @@ data_delex = MultiWozDataset(opt_delex, split=EVAL_SPLIT, shuffle=False)
 
 lex_dict = {}
 delex_dict = {}
-max_num = 20
+max_num = 100
 for d in data:
     lex_dict[d['name']] = d
-    #if len(lex_dict) == max_num: break
+    if len(lex_dict) == max_num: break
 
 for d in data_delex:
     delex_dict[d['name']] = d
-    #if len(delex_dict) == max_num: break
+    if len(delex_dict) == max_num: break
 
 if 'openai-gpt' in model_checkpoint:
     tokenizer = OpenAIGPTTokenizer.from_pretrained(model_checkpoint)
@@ -98,7 +102,7 @@ else:
 model.eval()
 #model.to('cuda')
 
-break_tokens = tokenizer.encode("{}".format(tokenizer._eos_token))
+break_tokens = tokenizer.encode("{}".format(tokenizer._eos_token), add_special_tokens=False)
 # TODO: load max input length properly
 MAX_LEN = 1024 
 #MAX_LEN = model.config.n_ctx 
@@ -107,12 +111,23 @@ MAX_LEN = 1024
 generated_dict = {}
 num_data = len(data)
 
+header_str = lambda head_id: f"<|start_header_id|>{head_id}<|end_header_id|>"
+eot_str = tokenizer.eos_token
+
+if USE_DB_SEARCH and USE_ORACLE_BELIEF:
+    with open('resources/llama3/test.history_belief_dbsearch_action_sys_delex_key.json','r') as f:
+        dial_desired_outputs =json.load(f)
+else:     
+    with open('resources/llama3/test.history_belief_action_sys_delex_key.json','r') as f:
+        dial_desired_outputs =json.load(f)
+
+
 for i, dial_name in enumerate(lex_dict):
     if EVAL_SPLIT == 'train' and i > 1000:
         break
     d = lex_dict[dial_name]
     d_delex = delex_dict[dial_name]
-    print('{} [{}/{}] \r'.format(d['name'], i, num_data), end='')
+    print('{} [{}/{}]\n'.format(d['name'], i, num_data), end='')
     sys.stdout.flush()
     beliefs_raw = d['belief_raw']
     user = d['input_raw']
@@ -152,27 +167,34 @@ for i, dial_name in enumerate(lex_dict):
     db_data = d['db']
     goal = multiwoz_data[dial_name]['goal']
 
+    dial_desireds = dial_desired_outputs[dial_name]
+
+    generated_raw = []
     generated = []
     model_context = []
     for turn_id, (usr_turn, _) in enumerate(zip(user, system)):
-
-        if turn_id == 0:
-            tmp_text = '<|user|> {}'.format(usr_turn.strip())
-        else:
-            tmp = []
-            for k in range(turn_id):
-                tmp.append('<|user|> {}'.format(user[k].strip()))
-                tmp.append('<|system|> {}'.format(system[k].strip()))
-
-            tmp.append('<|user|> {}'.format(usr_turn.strip()))
-
-            # trim history
-            if HISTORY_LEN and len(tmp) > HISTORY_LEN:
-                tmp = tmp[-1*HISTORY_LEN:]
-            tmp_text = ' '.join(tmp)
-        
+        tmp_text = dial_desireds[turn_id]
+        text = re.sub(r"\\n", r"\n", tmp_text)
         if dial_name == 'SNG02319.json':
-            tmp_text = tmp_text.replace('300 will', '03:00 will')
+            text = text.replace('300 will', '03:00 will')
+        
+        if USE_DB_SEARCH:
+            db_header = header_str("dbsearch")
+            db_text = f"{db_header}{text.split(db_header)[1].split(eot_str)[0]}{eot_str}"
+        
+        header_id = "response"
+        if not USE_ORACLE_BELIEF:
+            header_id = "belief"
+        elif not USE_ORACLE_ACTION:
+            header_id = "action"
+        else:
+            pass # header_id = response
+        header = header_str(header_id)+"\n\n"
+        header_begin = text.find(header)
+        text = text[:header_begin+len(header)]
+
+
+        """
         # TODO temp fix. i don't know why it happened but they started with `<|begin_of_text|><|begin_of_text|>`
         #text = '{} <|context|> {} <|endofcontext|> '.format(tokenizer._bos_token, tmp_text)
         text = ' <|context|> {} <|endofcontext|> '.format(tmp_text)
@@ -193,10 +215,11 @@ for i, dial_name in enumerate(lex_dict):
             turn_action = target_action[turn_id]
             action_str = '<|action|> {} <|endofaction|>'.format(' , '.join(turn_action))
             text = text + ' ' + action_str
-
-
+        """
+        #print(text)
+        #print("=====")
         model_context.append(text)
-        indexed_tokens = tokenizer.encode(text)
+        indexed_tokens = tokenizer.encode(text, add_special_tokens=False)
         if len(indexed_tokens) > MAX_LEN:
             indexed_tokens = indexed_tokens[-1*MAX_LEN:]
 
@@ -208,6 +231,8 @@ for i, dial_name in enumerate(lex_dict):
         predicted_index = indexed_tokens[-1]
 
         if USE_DB_SEARCH and not USE_ORACLE_BELIEF: # generate belief, then get DB search results, then continue generation (greedy decoding)
+            # TODO: well... actually... no
+            assert False
             with torch.no_grad():
                 while predicted_index not in break_tokens:
                     outputs = model(tokens_tensor)
@@ -228,7 +253,7 @@ for i, dial_name in enumerate(lex_dict):
                 text = '{} {}'.format(tmp_pred, db_text_dynamic)
 
             # continue generation
-            indexed_tokens = tokenizer.encode(text)
+            indexed_tokens = tokenizer.encode(text, add_special_tokens=False)
             if len(indexed_tokens) > MAX_LEN:
                 indexed_tokens = indexed_tokens[-1 * MAX_LEN:]
 
@@ -264,7 +289,7 @@ for i, dial_name in enumerate(lex_dict):
                                 len_actions > 10 and not truncate_action):
                             actions = '<|action|> {} <|endofaction|>'.format(' , '.join(list(set(new_actions))))
                             indexed_tokens = tokenizer.encode(
-                                '{} {}'.format(predicted_text.split('<|action|>')[0], actions))
+                                '{} {}'.format(predicted_text.split('<|action|>')[0], actions), add_special_tokens=False,)
                             truncate_action = True
 
                     tokens_tensor = torch.tensor([indexed_tokens]).to('cuda')
@@ -284,17 +309,36 @@ for i, dial_name in enumerate(lex_dict):
                         tokens_tensor,
                         # indexed_tokens,
                         do_sample=True,
-                        max_length=MAX_LEN,
+                        max_length=min(MAX_LEN, len(tokens_tensor[0])+FASTGEN_OUTPUT_LEN) if FASTGEN_OUTPUT_LEN and FASTGEN_OUTPUT_LEN > 0 else MAX_LEN,
                         top_p=0.5,
                         top_k=0,
                         pad_token_id = tokenizer.eos_token_id,
+                        eos_token_id = [],
                     )
-                    predicted_text = tokenizer.decode(sample_output[0])
-                    tmp = ' '.join([predicted_text.split('<|endofresponse|>')[0], '<|endofresponse|>'])
-                    predicted_text = tmp
+                    predicted_text_raw = tokenizer.decode(sample_output[0])
+                    #print(predicted_text_raw)
+                    #print("======\n======")
+                    response_header = header_str("response")
+                    response_begin = predicted_text_raw.find(response_header)
+                    if response_begin == -1:
+                        tmp = predicted_text_raw.split(eot_str)
+                        tmp = [t.strip() for t in tmp]
+                        predicted_text = eot_str.join([t for t in tmp if t != ""])
+                    else:
+                        resp_eot_begin = predicted_text_raw[response_begin:].find(eot_str)
+                        if resp_eot_begin == -1:
+                            resp_eot_begin = len(predicted_text[0])-len(eot_str)
+                        else:
+                            resp_eot_begin += response_begin
+                        predicted_text = predicted_text_raw[:resp_eot_begin+len(eot_str)]
+                    #tmp = ' '.join([predicted_text_raw.split('<|endofresponse|>')[0], '<|endofresponse|>'])
+                    #predicted_text = tmp
+                    generated_raw.append(predicted_text_raw)
                     generated.append(predicted_text)
+                    
 
                 elif decoding == 'greedy':
+                    assert False
                     # GREEDY DECODING
                     
                     # sample_output = model.generate(
@@ -325,7 +369,7 @@ for i, dial_name in enumerate(lex_dict):
                                     len_actions > 10 and not truncate_action):
                                 actions = '<|action|> {} <|endofaction|>'.format(' , '.join(list(set(new_actions))))
                                 indexed_tokens = tokenizer.encode(
-                                    '{} {}'.format(predicted_text.split('<|action|>')[0], actions))
+                                    '{} {}'.format(predicted_text.split('<|action|>')[0], actions), add_special_tokens=False,)
                                 truncate_action = True
                                 
                         tokens_tensor = torch.tensor([indexed_tokens]).to('cuda')
@@ -343,6 +387,18 @@ for i, dial_name in enumerate(lex_dict):
                 # predicted_text = tmp
                 # generated.append(predicted_text)
 
+    # TODO
+    generated_dict[d['name']] = {
+        'target_belief': dialogue_aggregated_target_belief,
+        'target_turn_belief': dialogue_target_belief,
+        'target_response': target_response,
+        'generated': generated,
+        'generated_raw': generated_raw,
+        'target_action': target_action,
+        'target_user': user,
+        'model_context': model_context
+    }
+    """
     dialogue_aggregated_pred_belief = []
     dialogue_pred_belief = []
     dialogue_pred_responses = []
@@ -392,6 +448,7 @@ for i, dial_name in enumerate(lex_dict):
         'target_user': user,
         'model_context': model_context
     }
+    """
 
 
 save_name = '{}_{}'.format(exp_name, EVAL_SPLIT)
