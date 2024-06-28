@@ -25,7 +25,7 @@ import sys
 import os
 import re
 
-
+os.environ["TOKENIZERS_PARALLELISM"]="false"
 
 opt = ArgsParser().parse()
 opt.multiwoz_version = '2.1'
@@ -47,6 +47,7 @@ USE_DYNAMIC_DB = opt.use_dynamic_db
 # EVAL_SPLIT = 'test'
 EVAL_SPLIT = opt.split_set
 FASTGEN_OUTPUT_LEN = 192
+USE_MULTIPROCESSING = True
 
 decoding = opt.decoding
 
@@ -76,7 +77,7 @@ data_delex = MultiWozDataset(opt_delex, split=EVAL_SPLIT, shuffle=False)
 
 lex_dict = {}
 delex_dict = {}
-max_num = 10
+max_num = 100
 for d in data:
     lex_dict[d['name']] = d
     if len(lex_dict) == max_num: break
@@ -86,14 +87,14 @@ for d in data_delex:
     if len(delex_dict) == max_num: break
 
 if 'openai-gpt' in model_checkpoint:
-    tokenizer = OpenAIGPTTokenizer.from_pretrained(model_checkpoint)
-    tokenizer.add_special_tokens({'bos_token': '<|endoftext|>'})
-    tokenizer.add_special_tokens({'eos_token': '<|endoftext|>'})
+    tknzer = OpenAIGPTTokenizer.from_pretrained(model_checkpoint)
+    tknzer.add_special_tokens({'bos_token': '<|endoftext|>'})
+    tknzer.add_special_tokens({'eos_token': '<|endoftext|>'})
 elif "llama" in model_checkpoint:
-    tokenizer = AutoTokenizer.from_pretrained(model_checkpoint)
-    tokenizer.pad_token_id = tokenizer.eos_token_id
+    tknzer = AutoTokenizer.from_pretrained(model_checkpoint)
+    tknzer.pad_token_id = tknzer.eos_token_id
 else:
-    tokenizer = GPT2Tokenizer.from_pretrained(model_checkpoint)
+    tknzer = GPT2Tokenizer.from_pretrained(model_checkpoint)
 
 if 'openai-gpt' in model_checkpoint:
     model = OpenAIGPTLMHeadModel.from_pretrained(model_checkpoint)
@@ -107,7 +108,7 @@ else:
 model.eval()
 #model.to('cuda')
 
-break_tokens = tokenizer.encode("{}".format(tokenizer._eos_token), add_special_tokens=False)
+break_tokens = tknzer.encode("{}".format(tknzer._eos_token), add_special_tokens=False)
 # TODO: load max input length properly
 MAX_LEN = 1024 
 #MAX_LEN = model.config.n_ctx 
@@ -119,7 +120,7 @@ num_data = len(data)
 hbegin_str = "<|start_header_id|>"
 hend_str = "<|end_header_id|>"
 get_header_str = lambda head_id: f"{hbegin_str}{head_id}{hend_str}"
-eot_str = tokenizer.eos_token
+eot_str = tknzer.eos_token
 
 def get_first_appear(header_id, text, end_with_other_header=True) -> Tuple[str, Tuple[int, int]]:
     """
@@ -255,7 +256,7 @@ for i, dial_name in enumerate(lex_dict):
 
         """
         # TODO temp fix. i don't know why it happened but they started with `<|begin_of_text|><|begin_of_text|>`
-        #text = '{} <|context|> {} <|endofcontext|> '.format(tokenizer._bos_token, tmp_text)
+        #text = '{} <|context|> {} <|endofcontext|> '.format(tknzer._bos_token, tmp_text)
         text = ' <|context|> {} <|endofcontext|> '.format(tmp_text)
 
 
@@ -278,7 +279,7 @@ for i, dial_name in enumerate(lex_dict):
         #print(text)
         #print("=====")
         model_context.append(text)
-        indexed_tokens = tokenizer.encode(text, add_special_tokens=False)
+        indexed_tokens = tknzer.encode(text, add_special_tokens=False)
         if len(indexed_tokens) > MAX_LEN:
             indexed_tokens = indexed_tokens[-1*MAX_LEN:]
 
@@ -301,10 +302,10 @@ for i, dial_name in enumerate(lex_dict):
                     tokens_tensor = torch.tensor([indexed_tokens]).to('cuda')
                     if len(indexed_tokens) > MAX_LEN:
                         break
-                    if tokenizer.decode(indexed_tokens).endswith('<|endofbelief|>'):
+                    if tknzer.decode(indexed_tokens).endswith('<|endofbelief|>'):
                         break
 
-            tmp_pred = tokenizer.decode(indexed_tokens)
+            tmp_pred = tknzer.decode(indexed_tokens)
             if not USE_DYNAMIC_DB: # use oracle db
                 text = '{} {}'.format(tmp_pred, db_text)
             else: # use dynamic db search results (using generated belief)
@@ -312,7 +313,7 @@ for i, dial_name in enumerate(lex_dict):
                 text = '{} {}'.format(tmp_pred, db_text_dynamic)
 
             # continue generation
-            indexed_tokens = tokenizer.encode(text, add_special_tokens=False)
+            indexed_tokens = tknzer.encode(text, add_special_tokens=False)
             if len(indexed_tokens) > MAX_LEN:
                 indexed_tokens = indexed_tokens[-1 * MAX_LEN:]
 
@@ -334,7 +335,7 @@ for i, dial_name in enumerate(lex_dict):
                     indexed_tokens += [predicted_index]
 
                     # sometime model generate repeated actions, we just use truncate actions if this happens
-                    predicted_text = tokenizer.decode(indexed_tokens)
+                    predicted_text = tknzer.decode(indexed_tokens)
                     if '<|action|>' in predicted_text:
                         generated_actions = predicted_text.split('<|action|>')[-1].split('<|endofaction|>')[
                             0].split(',')
@@ -347,17 +348,17 @@ for i, dial_name in enumerate(lex_dict):
                         if len(list(set(new_actions))) > len(new_actions) or (
                                 len_actions > 10 and not truncate_action):
                             actions = '<|action|> {} <|endofaction|>'.format(' , '.join(list(set(new_actions))))
-                            indexed_tokens = tokenizer.encode(
+                            indexed_tokens = tknzer.encode(
                                 '{} {}'.format(predicted_text.split('<|action|>')[0], actions), add_special_tokens=False,)
                             truncate_action = True
 
                     tokens_tensor = torch.tensor([indexed_tokens]).to('cuda')
                     if len(indexed_tokens) > MAX_LEN:
                         break
-                    if tokenizer.decode(indexed_tokens).endswith('<|endofresponse|>'):
+                    if tknzer.decode(indexed_tokens).endswith('<|endofresponse|>'):
                         break
 
-                predicted_text = tokenizer.decode(indexed_tokens)
+                predicted_text = tknzer.decode(indexed_tokens)
                 generated.append(predicted_text)
 
         else: # generate belief, action, and response once
@@ -371,10 +372,10 @@ for i, dial_name in enumerate(lex_dict):
                         max_length=min(MAX_LEN, len(tokens_tensor[0])+FASTGEN_OUTPUT_LEN) if FASTGEN_OUTPUT_LEN and FASTGEN_OUTPUT_LEN > 0 else MAX_LEN,
                         top_p=0.5,
                         top_k=0,
-                        pad_token_id = tokenizer.eos_token_id,
+                        pad_token_id = tknzer.eos_token_id,
                         eos_token_id = [],
                     )
-                    predicted_text_raw = tokenizer.decode(sample_output[0])
+                    predicted_text_raw = tknzer.decode(sample_output[0])
                     #print(predicted_text_raw)
                     #print("======\n======")
                     response_header = get_header_str("response")
@@ -415,7 +416,7 @@ for i, dial_name in enumerate(lex_dict):
                         indexed_tokens += [predicted_index]
                         
                         # sometime model generate repeated actions, we just use truncate actions if this happens
-                        predicted_text = tokenizer.decode(indexed_tokens)
+                        predicted_text = tknzer.decode(indexed_tokens)
                         if '<|action|>' in predicted_text:
                             generated_actions = predicted_text.split('<|action|>')[-1].split('<|endofaction|>')[
                                 0].split(',')
@@ -428,109 +429,189 @@ for i, dial_name in enumerate(lex_dict):
                             if len(list(set(new_actions))) > len(new_actions) or (
                                     len_actions > 10 and not truncate_action):
                                 actions = '<|action|> {} <|endofaction|>'.format(' , '.join(list(set(new_actions))))
-                                indexed_tokens = tokenizer.encode(
+                                indexed_tokens = tknzer.encode(
                                     '{} {}'.format(predicted_text.split('<|action|>')[0], actions), add_special_tokens=False,)
                                 truncate_action = True
                                 
                         tokens_tensor = torch.tensor([indexed_tokens]).to('cuda')
                         if len(indexed_tokens) > MAX_LEN:
                             break
-                        if tokenizer.decode(indexed_tokens).endswith('<|endofresponse|>'):
+                        if tknzer.decode(indexed_tokens).endswith('<|endofresponse|>'):
                             break
                             
-                    predicted_text = tokenizer.decode(indexed_tokens)
+                    predicted_text = tknzer.decode(indexed_tokens)
                     tmp = ' '.join([predicted_text.split('<|endofresponse|>')[0], '<|endofresponse|>'])
                     generated.append(predicted_text)
 
-                # predicted_text = tokenizer.decode(sample_output[0])
+                # predicted_text = tknzer.decode(sample_output[0])
                 # tmp = ' '.join([predicted_text.split('<|endofresponse|>')[0], '<|endofresponse|>'])
                 # predicted_text = tmp
                 # generated.append(predicted_text)
+    if USE_MULTIPROCESSING:
+        generated_dict[d['name']] = {
+            'target_belief': dialogue_aggregated_target_belief,
+            'target_turn_belief': dialogue_target_belief,
+            'target_response': target_response,
+            'generated': generated,
+            'generated_raw': generated_raw,
+            'target_action': target_action,
+            'target_user': user,
+            'model_context': model_context
+        }
+    else:
+        dialogue_aggregated_pred_belief = []
+        dialogue_pred_belief = []
+        dialogue_pred_responses = []
+        dialogue_pred_action = []
+        # aggregate belief states
+        for turn, pred in enumerate(generated):
+            # 믿음 상태 얻기
+            parsed_belief, b_e = get_first_appear("belief", pred)
+            new_belief = set()
+            if b_e[0] != -1:
+                parsed_belief = remove_header_and_eot(parsed_belief)
+                belief = parsed_belief.split(',')
+                for bs in belief:
+                    bs = bs.strip(' .,\n')
+                    if bs == '': continue
+                    if bs not in new_belief:
+                        new_belief.add(bs)
+            new_belief=list(new_belief)
+            if len(new_belief) == 0:
+                new_belief = ['']
+                # 이번 차례에 생성된 belief가 없는 경우에 이전 차례 값으로 '봐주기'
+                # belief 특혜?
+                if len(dialogue_pred_belief) > 0:
+                    new_belief = dialogue_pred_belief[-1]
+            dialogue_pred_belief.append(new_belief)
+            dialogue_aggregated_pred_belief += [bs for bs in new_belief if bs not in ['', ' ']+dialogue_aggregated_pred_belief]
+            
 
-    # TODO
-    #generated_dict[d['name']] = {
-    #    'target_belief': dialogue_aggregated_target_belief,
-    #    'target_turn_belief': dialogue_target_belief,
-    #    'target_response': target_response,
-    #    'generated': generated,
-    #    'generated_raw': generated_raw,
-    #    'target_action': target_action,
-    #    'target_user': user,
-    #    'model_context': model_context
-    #}
-    #
-    dialogue_aggregated_pred_belief = []
-    dialogue_pred_belief = []
-    dialogue_pred_responses = []
-    dialogue_pred_action = []
-    # aggregate belief states
-    for turn, pred in enumerate(generated):
-        # 믿음 상태 얻기
-        parsed_belief, b_e = get_first_appear("belief", pred)
-        new_belief = set()
-        if b_e[0] != -1:
-            parsed_belief = remove_header_and_eot(parsed_belief)
-            belief = parsed_belief.split(',')
-            for bs in belief:
-                bs = bs.strip(' .,\n')
-                if bs == '': continue
-                if bs not in new_belief:
-                    new_belief.add(bs)
-        new_belief=list(new_belief)
-        if len(new_belief) == 0:
-            new_belief = ['']
-            # 이번 차례에 생성된 belief가 없는 경우에 이전 차례 값으로 '봐주기'
-            # belief 특혜?
-            if len(dialogue_pred_belief) > 0:
-                new_belief = dialogue_pred_belief[-1]
-        dialogue_pred_belief.append(new_belief)
-        dialogue_aggregated_pred_belief += [bs for bs in new_belief if bs not in ['', ' ']+dialogue_aggregated_pred_belief]
+            # 대화 행동 얻기
+            parsed_action, b_e = get_first_appear("action", pred)
+            new_action = set()
+            if b_e[0] != -1:
+                parsed_action = remove_header_and_eot(parsed_action)
+                action = parsed_action.split(',')
+                for act in action:
+                    act = act.strip(' .,\n')
+                    if act == '': continue
+                    if act not in new_action:
+                        new_action.add(act)
+            new_action=list(new_action)
+            # belief랑 다르게 빈 str 넣어주는게 없네?
+            #if len(new_action) == 0:
+            #    new_action = ['']
+            dialogue_pred_action.append(new_action)
+
+
+            # 응답 얻기
+            parsed_resp, b_e = get_first_appear("response", pred)
+            if b_e[0] != -1:
+                parsed_resp = remove_header_and_eot(parsed_resp)
+                #assistant\n\n 가 있다면 발견해서 지웁니다.
+                parsed_resp = parsed_resp.replace("assistant\n\n","")
+                parsed_resp = parsed_resp.strip(' .,\n')
+            else:
+                parsed_resp = ''
+            dialogue_pred_responses.append(parsed_resp)
+
+        generated_dict[d['name']] = {
+            'target_belief': dialogue_aggregated_target_belief,
+            'target_turn_belief': dialogue_target_belief,
+            'generated_belief': dialogue_aggregated_pred_belief,
+            'generated_turn_belief': dialogue_pred_belief,
+            'target_response': target_response,
+            'generated_response': dialogue_pred_responses,
+            'target_action': target_action,
+            'generated_action': dialogue_pred_action,
+            'target_user': user,
+            'model_context': model_context,
+            'generated': generated,
+            'generated_raw': generated_raw,
+        }
+
+if USE_MULTIPROCESSING:
+    print("start parse and saving...(multiprocessing)")
+    import multiprocessing as mp
+
+    def mp_parsing(generated):
+        dialogue_aggregated_pred_belief = []
+        dialogue_pred_belief = []
+        dialogue_pred_responses = []
+        dialogue_pred_action = []
+        # aggregate belief states
+        for turn, pred in enumerate(generated):
+            # 믿음 상태 얻기
+            parsed_belief, b_e = get_first_appear("belief", pred)
+            new_belief = set()
+            if b_e[0] != -1:
+                parsed_belief = remove_header_and_eot(parsed_belief)
+                belief = parsed_belief.split(',')
+                for bs in belief:
+                    bs = bs.strip(' .,\n')
+                    if bs == '': continue
+                    if bs not in new_belief:
+                        new_belief.add(bs)
+            new_belief=list(new_belief)
+            if len(new_belief) == 0:
+                new_belief = ['']
+                # 이번 차례에 생성된 belief가 없는 경우에 이전 차례 값으로 '봐주기'
+                # belief 특혜?
+                if len(dialogue_pred_belief) > 0:
+                    new_belief = dialogue_pred_belief[-1]
+            dialogue_pred_belief.append(new_belief)
+            dialogue_aggregated_pred_belief += [bs for bs in new_belief if bs not in ['', ' ']+dialogue_aggregated_pred_belief]
+            
+
+            # 대화 행동 얻기
+            parsed_action, b_e = get_first_appear("action", pred)
+            new_action = set()
+            if b_e[0] != -1:
+                parsed_action = remove_header_and_eot(parsed_action)
+                action = parsed_action.split(',')
+                for act in action:
+                    act = act.strip(' .,\n')
+                    if act == '': continue
+                    if act not in new_action:
+                        new_action.add(act)
+            new_action=list(new_action)
+            # belief랑 다르게 빈 str 넣어주는게 없네?
+            #if len(new_action) == 0:
+            #    new_action = ['']
+            dialogue_pred_action.append(new_action)
+
+
+            # 응답 얻기
+            parsed_resp, b_e = get_first_appear("response", pred)
+            if b_e[0] != -1:
+                parsed_resp = remove_header_and_eot(parsed_resp)
+                #assistant\n\n 가 있다면 발견해서 지웁니다.
+                parsed_resp = parsed_resp.replace("assistant\n\n","")
+                parsed_resp = parsed_resp.strip(' .,\n')
+            else:
+                parsed_resp = ''
+            dialogue_pred_responses.append(parsed_resp)
+        return (
+            dialogue_aggregated_pred_belief,
+            dialogue_pred_belief,
+            dialogue_pred_responses,
+            dialogue_pred_action
+        )
+
+    with mp.Pool(14) as pool:
+        generateds = [generated_dict[key]["generated"] for key in generated_dict.keys()]
+        for ret, key in zip(pool.imap(mp_parsing, generateds), generated_dict.keys()):
+            dialogue_aggregated_pred_belief,\
+                dialogue_pred_belief,\
+                dialogue_pred_responses,\
+                dialogue_pred_action = ret
+            generated_dict[key]["generated_belief"] = dialogue_aggregated_pred_belief
+            generated_dict[key]["generated_turn_belief"] = dialogue_pred_belief
+            generated_dict[key]["generated_response"] = dialogue_pred_responses
+            generated_dict[key]["generated_action"] = dialogue_pred_action
+
         
-
-        # 대화 행동 얻기
-        parsed_action, b_e = get_first_appear("action", pred)
-        new_action = set()
-        if b_e[0] != -1:
-            parsed_action = remove_header_and_eot(parsed_action)
-            action = parsed_action.split(',')
-            for act in action:
-                act = act.strip(' .,\n')
-                if act == '': continue
-                if act not in new_action:
-                    new_action.add(act)
-        new_action=list(new_action)
-        # belief랑 다르게 빈 str 넣어주는게 없네?
-        #if len(new_action) == 0:
-        #    new_action = ['']
-        dialogue_pred_action.append(new_action)
-
-
-        # 응답 얻기
-        parsed_resp, b_e = get_first_appear("response", pred)
-        if b_e[0] != -1:
-            parsed_resp = remove_header_and_eot(parsed_resp)
-            #assistant\n\n 가 있다면 발견해서 지웁니다.
-            parsed_resp = parsed_resp.replace("assistant\n\n","")
-            parsed_resp = parsed_resp.strip(' .,\n')
-        else:
-            parsed_resp = ''
-        dialogue_pred_responses.append(parsed_resp)
-
-    generated_dict[d['name']] = {
-        'target_belief': dialogue_aggregated_target_belief,
-        'target_turn_belief': dialogue_target_belief,
-        'generated_belief': dialogue_aggregated_pred_belief,
-        'generated_turn_belief': dialogue_pred_belief,
-        'target_response': target_response,
-        'generated_response': dialogue_pred_responses,
-        'target_action': target_action,
-        'generated_action': dialogue_pred_action,
-        'target_user': user,
-        'model_context': model_context,
-        'generated': generated,
-        'generated_raw': generated_raw,
-    }
-
 
 save_name = '{}_{}'.format(exp_name, EVAL_SPLIT)
 
