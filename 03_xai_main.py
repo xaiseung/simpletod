@@ -12,6 +12,7 @@ import random
 import re
 # import shutil
 from typing import Any, Dict, List, Tuple
+from functools import partial
 
 import numpy as np
 import torch
@@ -74,8 +75,6 @@ def get_model_tokenizer(args):
         assert args.model_name_or_path
         config_class, model_class, tokenizer_class = AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-        
-
     if args.config_name:
         config = config_class.from_pretrained(args.config_name, cache_dir=args.cache_dir)
     elif args.model_name_or_path:
@@ -116,7 +115,12 @@ def get_model_tokenizer(args):
             #quantization_config=bnb_config
         )
         tokenizer.model_max_length = args.block_size
+        args.block_size = min(args.block_size, tokenizer.model_max_length)
+        tokenizer.eos_token = "<|end_of_text|>"
+        tokenizer.eos_token_id = tokenizer.encode("<|end_of_text|>", add_special_tokens=False)[0]
+        model.config.eos_token_id = tokenizer.eos_token_id
         tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
     else:
         if args.model_name_or_path:
             model = model_class.from_pretrained(
@@ -139,29 +143,7 @@ def get_model_tokenizer(args):
 
     return model, tokenizer, model_class, args
 
-
-def get_training_info(dataloader, args):
-    global_step = 0
-    epochs_trained = 0
-    steps_trained_in_current_epoch = 0
-
-    # Check if continuing training from a checkpoint
-    if args.model_name_or_path and os.path.exists(args.model_name_or_path):
-        try:
-            # set global_step to gobal_step of last saved checkpoint from model path
-            checkpoint_suffix = args.model_name_or_path.split("-")[-1].split("/")[0]
-            global_step = int(checkpoint_suffix)
-            epochs_trained = global_step // (len(dataloader) // args.gradient_accumulation_steps)
-            steps_trained_in_current_epoch = global_step % (len(dataloader) // args.gradient_accumulation_steps)
-
-            logger.info("  Continuing training from checkpoint, will skip to saved global_step")
-            logger.info("  Continuing training from epoch %d", epochs_trained)
-            logger.info("  Continuing training from global step %d", global_step)
-            logger.info("  Will skip the first %d steps in the first epoch", steps_trained_in_current_epoch)
-        except ValueError:
-            logger.info("  Starting fine-tuning.")
-    return global_step, epochs_trained, steps_trained_in_current_epoch
-
+#from LORA Code
 def get_num_layers(model):
     numbers = set()
     for name, _ in model.named_parameters():
@@ -201,6 +183,19 @@ class CustomTrainer(SFTTrainer):
             logger.info(f"{l}")
         return result
 
+
+def tokenize_fn(example, tokenizer):
+    to_break = lambda s: re.sub(r"\\n", r"\n", s)
+    if hasattr(example["text"], "__getitem__"):
+        for i in range(len(example["text"])):
+            example["text"][i] = to_break(example["text"][i])
+    else:
+        example["text"] = to_break(example["text"])
+    be = tokenizer(example["text"],
+                   truncation=True,
+                   add_special_tokens=False)
+    return be
+
 def train(args, tokenized_datasets, model, tokenizer):
     global CUSTOM_TRAINER_OUTPUT_DIR
     # total iteration and batch size
@@ -210,27 +205,10 @@ def train(args, tokenized_datasets, model, tokenizer):
     else:
         t_total = len(tokenized_datasets["train"]) // args.gradient_accumulation_steps * args.num_train_epochs
 
-    total_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu) * args.gradient_accumulation_steps * (
-        torch.distributed.get_world_size() if args.local_rank != -1 else 1)
+    total_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu) * args.gradient_accumulation_steps
 
     # Prepare optimizer and schedule (linear warmup and decay)
     optimizer, scheduler = get_optimizer_scheduler(args, model, t_total)
-
-    #if args.fp16:
-    #    try:
-    #        from apex import amp
-    #    except ImportError:
-    #        raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
-    #    model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
-    ## multi-gpu training
-    #if args.n_gpu > 1 and not isinstance(model, torch.nn.DataParallel):
-    #    model = torch.nn.DataParallel(model)
-
-    ## Distributed training
-    #if args.local_rank != -1:
-    #    model = torch.nn.parallel.DistributedDataParallel(
-    #        model, device_ids=[args.local_rank], output_device=args.local_rank, find_unused_parameters=True
-    #    )
 
     # Train!
     logger.info("***** Running training *****")
@@ -323,18 +301,16 @@ def evaluate(args, model, tokenizer, prefix="", tokenized_datasets=None):
     if tokenized_datasets is None:
         raw_datasets = datasets.load_dataset(
             "text",
-            data_files={"eval":args.eval_data_file})
-        def tokenize_fn(example):
-            be = tokenizer(example["text"], truncation=True)
-            return be
+            data_files={"test":args.eval_data_file})
 
-        tokenized_datasets = raw_datasets.map(tokenize_fn, batched=True)
+        tokenized_datasets = raw_datasets.map(partial(tokenize_fn, tokenizer=tokenizer), batched=True)
         tokenized_datasets = tokenized_datasets.remove_columns(["text"])
         tokenized_datasets.set_format("torch")
-
+    
+    test_datasets = tokenized_datasets["test"]
     # Eval!
     logger.info("***** Running evaluation {} *****".format(prefix))
-    logger.info("  Num examples = {}".format(len(tokenized_datasets["eval"])))
+    logger.info("  Num examples = {}".format(len(test_datasets)))
     logger.info("  Batch size = {}".format(args.per_gpu_eval_batch_size * max(1, args.n_gpu)))
     eval_loss = 0.0
     nb_eval_steps = 0
@@ -356,7 +332,7 @@ def evaluate(args, model, tokenizer, prefix="", tokenized_datasets=None):
         model=model,
         args=training_args,
         data_collator=data_collator,
-        eval_dataset=tokenized_datasets["test"],
+        eval_dataset=test_datasets,
         tokenizer=tokenizer,
     )
     eval_output = trainer.evaluate()
@@ -410,23 +386,15 @@ def main():
         args.fp16,
     )
 
-    # Load pretrained model and tokenizer
-    if args.local_rank not in [-1, 0]:
-        torch.distributed.barrier()  # if not the first process, do not load pretrained model & vocab
 
     model, tokenizer, model_class, args = get_model_tokenizer(args)
    
-    if args.local_rank == 0:
-        torch.distributed.barrier()  # finish barrier, when first process has loaded pretrained model & vocab
-
     logger.info("Training/evaluation parameters {}".format(args))
 
     
     tokenized_datasets = None
     # Training
     if args.do_train:
-        if args.local_rank not in [-1, 0]:
-            torch.distributed.barrier()  # only first process will preprocess data/caching
         # TODO: support for datasets `shuffling something`
         #train_dataset = load_and_cache_examples(args, tokenizer, evaluate=False)
         raw_datasets = datasets.load_dataset(
@@ -441,18 +409,9 @@ def main():
         desired_idx = set(rnd_idx[:400])
         raw_datasets["eval"] = raw_datasets["test"].filter(lambda example, idx: idx in desired_idx, with_indices=True)
 
-        def tokenize_fn(example):
-            be = tokenizer(example["text"],
-                           truncation=True,
-                           add_special_tokens=False,)
-            return be
-
-        tokenized_datasets = raw_datasets.map(tokenize_fn, batched=True)
+        tokenized_datasets = raw_datasets.map(partial(tokenize_fn, tokenizer=tokenizer), batched=True)
         tokenized_datasets = tokenized_datasets.remove_columns(["text"])
         tokenized_datasets.set_format("torch")
-
-        if args.local_rank == 0:
-            torch.distributed.barrier() # end of barrier
 
         global_step, train_loss = train(args, tokenized_datasets, model, tokenizer)
         logger.info(" global_step = {}, average loss = {}".format(global_step, train_loss))
@@ -486,7 +445,6 @@ def main():
             results.update(result)
 
     return results
-
 
 if __name__ == "__main__":
     main()

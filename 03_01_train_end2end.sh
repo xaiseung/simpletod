@@ -19,13 +19,13 @@ CUDA_VISIBLE_DEVICES=$1 python 03_xai_main.py \
     --do_eval \
     --eval_data_file=$TEST_FILE \
     --evaluate_during_training \
-    --save_steps 2000 \
-    --logging_steps 1000 \
+    --save_steps 5000 \
+    --logging_steps 2500 \
     --per_gpu_train_batch_size $BATCH \
-    --num_train_epochs 10 \
+    --num_train_epochs 100 \
     --block_size 1024 \
-    --gradient_accumulation_steps 8 \
-    --learning_rate 0.0001 \
+    --gradient_accumulation_steps 16 \
+    --learning_rate 0.00005 \
     --weight_decay 0.05 \
-    --warmup_steps 1000 \
+    --warmup_steps 2000 \
     --use_lora
