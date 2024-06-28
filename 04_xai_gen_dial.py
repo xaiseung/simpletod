@@ -1,4 +1,6 @@
 
+from typing import List, Tuple
+
 import torch
 import tokenizers
 from transformers import (
@@ -57,7 +59,10 @@ multiwoz_data = json.load(open('resources/multi-woz/lex.json','r'))
 # model_checkpoint = '../dialog-transformer/output/{}/{}/'.format(exp_name, checkpoint)
 model_checkpoint = opt.checkpoint
 exp_name = os.path.split(model_checkpoint)[0].split('/')[-2]
+ckpt_num = model_checkpoint.split('-')[-1]
+exp_name += ckpt_num
 print(exp_name)
+
 
 multiwoz_db = MultiWozDB()
 
@@ -71,7 +76,7 @@ data_delex = MultiWozDataset(opt_delex, split=EVAL_SPLIT, shuffle=False)
 
 lex_dict = {}
 delex_dict = {}
-max_num = 100
+max_num = 10
 for d in data:
     lex_dict[d['name']] = d
     if len(lex_dict) == max_num: break
@@ -111,8 +116,62 @@ MAX_LEN = 1024
 generated_dict = {}
 num_data = len(data)
 
-header_str = lambda head_id: f"<|start_header_id|>{head_id}<|end_header_id|>"
+hbegin_str = "<|start_header_id|>"
+hend_str = "<|end_header_id|>"
+get_header_str = lambda head_id: f"{hbegin_str}{head_id}{hend_str}"
 eot_str = tokenizer.eos_token
+
+def get_first_appear(header_id, text, end_with_other_header=True) -> Tuple[str, Tuple[int, int]]:
+    """
+    param:
+        - header_id:
+            찾아서 내용을 파싱하고자 하는 헤더 문자열
+        - text:
+            원본 텍스트, 헤더 찾는 곳
+        - end_with_other_header:
+          eot 토큰으로 끝나지 않아도 다른 헤더로 끊음
+          자연어 모델이 eot 토큰을 생성하지 않는 일부 경우에 대응함.
+    returns:
+        - parse_text:
+            파싱된 텍스트. 찾지 못했다면 빈 문자열 반환
+        - (begin, end)
+            원본 텍스트 (text)에서의 파싱된 텍스트의 위치. 찾지 못했다면 (-1, -1) 반환
+    """
+    header_str = get_header_str(header_id)
+    header_begin = text.find(header_str)
+    if header_begin == -1:
+        return "", (-1, -1)
+
+    eot_begin = text[header_begin:].find(eot_str)
+    if end_with_other_header:
+        other_header_begin = text[header_begin+len(hbegin_str):].find(hbegin_str)
+        if other_header_begin != -1:
+            other_header_begin += len(hbegin_str) #eot_begin와의 offset 반영
+            if eot_begin == -1:
+                eot_begin = other_header_begin - len(eot_str)
+            else:
+                eot_begin = min(eot_begin , other_header_begin-len(eot_str))
+    
+    if eot_begin == -1:    
+        eot_begin = len(text)-len(eot_str)
+    else:
+        eot_begin += header_begin
+    parsed_text = text[header_begin:eot_begin+len(eot_str)]
+    return parsed_text, (header_begin, eot_begin+len(eot_str))
+def remove_header_and_eot(text) -> str:
+    """
+    주어진 text에서 맨 앞에 등장한 header와 맨 뒤의 eot를 제거하고 그 사이 텍스트를 반환합니다.
+    중복된 eot와 header가 등장할 시 제거되지 않는 등 오작동할 수 있습니다.
+    eot가 없는 경우에는 헤더만 제거합니다.
+    추후 앞 뒤 개행문자와 공백을 제거합니다.
+    """
+    text = text.split(hend_str,maxsplit=1)[-1]
+    if text.find(eot_str) != -1:
+        text = eot_str.join(text.split(eot_str)[:-1])
+    text = text.strip("\n ")
+    return text
+
+
 
 if USE_DB_SEARCH and USE_ORACLE_BELIEF:
     with open('resources/llama3/test.history_belief_dbsearch_action_sys_delex_key.json','r') as f:
@@ -179,7 +238,7 @@ for i, dial_name in enumerate(lex_dict):
             text = text.replace('300 will', '03:00 will')
         
         if USE_DB_SEARCH:
-            db_header = header_str("dbsearch")
+            db_header = get_header_str("dbsearch")
             db_text = f"{db_header}{text.split(db_header)[1].split(eot_str)[0]}{eot_str}"
         
         header_id = "response"
@@ -189,7 +248,7 @@ for i, dial_name in enumerate(lex_dict):
             header_id = "action"
         else:
             pass # header_id = response
-        header = header_str(header_id)+"\n\n"
+        header = get_header_str(header_id)+"\n\n"
         header_begin = text.find(header)
         text = text[:header_begin+len(header)]
 
@@ -318,7 +377,7 @@ for i, dial_name in enumerate(lex_dict):
                     predicted_text_raw = tokenizer.decode(sample_output[0])
                     #print(predicted_text_raw)
                     #print("======\n======")
-                    response_header = header_str("response")
+                    response_header = get_header_str("response")
                     response_begin = predicted_text_raw.find(response_header)
                     if response_begin == -1:
                         tmp = predicted_text_raw.split(eot_str)
@@ -327,7 +386,7 @@ for i, dial_name in enumerate(lex_dict):
                     else:
                         resp_eot_begin = predicted_text_raw[response_begin:].find(eot_str)
                         if resp_eot_begin == -1:
-                            resp_eot_begin = len(predicted_text[0])-len(eot_str)
+                            resp_eot_begin = len(predicted_text_raw)-len(eot_str)
                         else:
                             resp_eot_begin += response_begin
                         predicted_text = predicted_text_raw[:resp_eot_begin+len(eot_str)]
@@ -335,7 +394,8 @@ for i, dial_name in enumerate(lex_dict):
                     #predicted_text = tmp
                     generated_raw.append(predicted_text_raw)
                     generated.append(predicted_text)
-                    
+                    del predicted_text_raw
+                    del predicted_text
 
                 elif decoding == 'greedy':
                     assert False
@@ -388,53 +448,73 @@ for i, dial_name in enumerate(lex_dict):
                 # generated.append(predicted_text)
 
     # TODO
-    generated_dict[d['name']] = {
-        'target_belief': dialogue_aggregated_target_belief,
-        'target_turn_belief': dialogue_target_belief,
-        'target_response': target_response,
-        'generated': generated,
-        'generated_raw': generated_raw,
-        'target_action': target_action,
-        'target_user': user,
-        'model_context': model_context
-    }
-    """
+    #generated_dict[d['name']] = {
+    #    'target_belief': dialogue_aggregated_target_belief,
+    #    'target_turn_belief': dialogue_target_belief,
+    #    'target_response': target_response,
+    #    'generated': generated,
+    #    'generated_raw': generated_raw,
+    #    'target_action': target_action,
+    #    'target_user': user,
+    #    'model_context': model_context
+    #}
+    #
     dialogue_aggregated_pred_belief = []
     dialogue_pred_belief = []
     dialogue_pred_responses = []
     dialogue_pred_action = []
     # aggregate belief states
     for turn, pred in enumerate(generated):
-        turn_pred_belief = []
-        if 'openai-gpt' in model_checkpoint:
-            belief = get_belief_openaigpt(pred)
-        else:
-            if 'dbsearch' in model_checkpoint or 'dbnmatch' in model_checkpoint or USE_DB_SEARCH or 'db' in model_checkpoint:
-                belief = get_belief_dbsearch(pred)
-            else:
-                belief = get_belief(pred)
-        if len(belief) > 0:
+        # 믿음 상태 얻기
+        parsed_belief, b_e = get_first_appear("belief", pred)
+        new_belief = set()
+        if b_e[0] != -1:
+            parsed_belief = remove_header_and_eot(parsed_belief)
+            belief = parsed_belief.split(',')
             for bs in belief:
-                if bs not in ['', ' '] and bs not in dialogue_aggregated_pred_belief:
-                    dialogue_aggregated_pred_belief.append(bs)
-            new_belief = list(set(belief))
-            dialogue_pred_belief.append(new_belief)
-        else:
-            if len(dialogue_pred_belief) == 0:
-                dialogue_pred_belief.append([''])
-            else:
-                dialogue_pred_belief.append(dialogue_pred_belief[-1])
-        if 'openai-gpt' in model_checkpoint:
-            gen_response = get_response_openaigpt(pred, tokenizer)
-        else:
-            gen_response = get_response(pred, tokenizer)
-        dialogue_pred_responses.append(gen_response)
+                bs = bs.strip(' .,\n')
+                if bs == '': continue
+                if bs not in new_belief:
+                    new_belief.add(bs)
+        new_belief=list(new_belief)
+        if len(new_belief) == 0:
+            new_belief = ['']
+            # 이번 차례에 생성된 belief가 없는 경우에 이전 차례 값으로 '봐주기'
+            # belief 특혜?
+            if len(dialogue_pred_belief) > 0:
+                new_belief = dialogue_pred_belief[-1]
+        dialogue_pred_belief.append(new_belief)
+        dialogue_aggregated_pred_belief += [bs for bs in new_belief if bs not in ['', ' ']+dialogue_aggregated_pred_belief]
+        
 
-        if 'openai-gpt' in model_checkpoint:
-            gen_action = get_action_openaigpt(pred)
+        # 대화 행동 얻기
+        parsed_action, b_e = get_first_appear("action", pred)
+        new_action = set()
+        if b_e[0] != -1:
+            parsed_action = remove_header_and_eot(parsed_action)
+            action = parsed_action.split(',')
+            for act in action:
+                act = act.strip(' .,\n')
+                if act == '': continue
+                if act not in new_action:
+                    new_action.add(act)
+        new_action=list(new_action)
+        # belief랑 다르게 빈 str 넣어주는게 없네?
+        #if len(new_action) == 0:
+        #    new_action = ['']
+        dialogue_pred_action.append(new_action)
+
+
+        # 응답 얻기
+        parsed_resp, b_e = get_first_appear("response", pred)
+        if b_e[0] != -1:
+            parsed_resp = remove_header_and_eot(parsed_resp)
+            #assistant\n\n 가 있다면 발견해서 지웁니다.
+            parsed_resp = parsed_resp.replace("assistant\n\n","")
+            parsed_resp = parsed_resp.strip(' .,\n')
         else:
-            gen_action = get_action(pred)
-        dialogue_pred_action.append(gen_action)
+            parsed_resp = ''
+        dialogue_pred_responses.append(parsed_resp)
 
     generated_dict[d['name']] = {
         'target_belief': dialogue_aggregated_target_belief,
@@ -446,9 +526,10 @@ for i, dial_name in enumerate(lex_dict):
         'target_action': target_action,
         'generated_action': dialogue_pred_action,
         'target_user': user,
-        'model_context': model_context
+        'model_context': model_context,
+        'generated': generated,
+        'generated_raw': generated_raw,
     }
-    """
 
 
 save_name = '{}_{}'.format(exp_name, EVAL_SPLIT)
