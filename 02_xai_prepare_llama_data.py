@@ -8,6 +8,7 @@ import json
 import random
 import os
 import pickle
+import re
 
 from transformers import GPT2Tokenizer, AutoTokenizer
 llama3_tknzer = AutoTokenizer.from_pretrained('meta-llama/meta-llama-3-8B-instruct')
@@ -29,6 +30,7 @@ for split in ['train', 'val', 'test']:
     opt_delex = ArgsParser().parse()
     data_delex = MultiWozDataset(opt_delex, split=split, shuffle=False)
 
+    key_new = []
     history_raw_new = []
     belief_raw_new = []
     belief_raw_none_new = []
@@ -59,6 +61,7 @@ for split in ['train', 'val', 'test']:
         goal = multiwoz_data[key]['goal']
 
         for i, (usr, sys) in enumerate(zip(inp, out)):
+            key_new.append(key)
             if i == 0:
                 history_new = 'user\n\n{}'.format(usr)
             else:
@@ -134,20 +137,25 @@ for split in ['train', 'val', 'test']:
             tmp_new = ' , '.join(tmp_act_new)
             action_raw_new.append(tmp_new)
 
-    def save_dial_msg(history=False,
-                        belief=False,
-                        dbsearch=False,
-                        dbnmatch=False,
-                        action=False,
-                        response=False):
-        tmp = []
-        
-        for inp, bs, dbs, dbnm, act, trg in zip(history_raw_new,
-                                                belief_raw_new,
-                                                db_search_raw,
-                                                db_nmatch_raw,
-                                                action_raw_new,
-                                                output_raw_delex_new):
+    def save_dial_msg(
+            history=False,
+            belief=False,
+            dbsearch=False,
+            dbnmatch=False,
+            action=False,
+            response=False):
+        for_json = {}
+        for key, inp, bs, dbs, dbnm, act, trg in zip(
+                key_new,
+                history_raw_new,
+                belief_raw_new,
+                db_search_raw,
+                db_nmatch_raw,
+                action_raw_new,
+                output_raw_delex_new
+            ):
+            if key not in for_json:
+                for_json[key] = []
             messages = []
             if history: messages.append({"role": "context", "content": inp.lower()})
             if belief: messages.append({"role": "belief", "content": bs.lower()})
@@ -155,7 +163,9 @@ for split in ['train', 'val', 'test']:
             if dbnmatch: messages.append({"role": "dbsearch", "content": dbnm.lower()})
             if action: messages.append({"role": "action", "content": act.lower()})
             if response: messages.append({"role": "response", "content": trg.lower()})
-            tmp.append(llama3_tknzer.decode(llama3_tknzer.apply_chat_template(messages)))
+            messages = llama3_tknzer.decode(llama3_tknzer.apply_chat_template(messages))
+            messages = re.sub(r"\n", r"\\n", messages)
+            for_json[key].append(messages)
         file_path = '{}/{}.'.format(save_dir, split)
         suffix = []
         if history: suffix += ['history']
@@ -167,10 +177,13 @@ for split in ['train', 'val', 'test']:
 
         file_path += '_'.join(suffix)
         with open(file_path, 'wt') as f:
-            for l in tmp:
-                f.write('{}\n'.format(l))
-        with open(file_path+'.pkl', "wb") as f:
-            pickle.dump(tmp, f)
+            for tmp in for_json:
+                for l in for_json[tmp]:
+                    f.write('{}\n'.format(l))
+        with open(file_path+"_key.json", "w") as f:
+            json.dump(for_json, f)
+        #with open(file_path+'.pkl', "wb") as f:
+        #    pickle.dump(tmp, f)
 
     save_dial_msg(history=True, belief=True, dbsearch=True, action=True, response=True)
     save_dial_msg(history=True, belief=True, dbnmatch=True, action=True, response=True)
