@@ -151,12 +151,15 @@ def get_num_layers(model):
             numbers.add(int(number))
     return max(numbers)
 
-def get_last_layer_linears(model):
+def get_last_layer_linears(model, n=1):
+    if n < 1:
+        raise ValueError("num_trained_layers should be >= 1")
     names = []
     
     num_layers = get_num_layers(model)
+    tgt_layers = [num_layers - i for i in range(n)]
     for name, module in model.named_modules():
-        if str(num_layers) in name and not "encoder" in name:
+        if any([str(num_tgt) in name for num_tgt in tgt_layers]) and not "encoder" in name:
             if isinstance(module, torch.nn.Linear):
                 names.append(name)
     return names
@@ -244,7 +247,7 @@ def train(args, tokenized_datasets, model, tokenizer):
     )
     # TODO: add arg to argparser for peft config
     #  - more option for target_modules outta 'last layer'
-    linears_last_layer = get_last_layer_linears(model)
+    linears_last_layer = get_last_layer_linears(model, n=args.num_trained_layers)
     if len(linears_last_layer) == 0:
         linears_last_layer = None
     
@@ -348,6 +351,7 @@ def main():
     parser.parser.add_argument("--lora_r", type=int, default=8, help="Dimension of adapter in LoRA")
     parser.parser.add_argument("--lora_alpha", type=float, default=8.0, help="Adapter scaler Alpha for LoRA")
     parser.parser.add_argument("--lora_dropout", type=float, default=0.1, help="Dropout rate of LoRA Adapter.")
+    parser.parser.add_argument("--num_trained_layers", type=int, default=1, help="The number of layer that will be trained")
     
     args = parser.parse()
 
