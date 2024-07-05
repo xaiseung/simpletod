@@ -359,10 +359,10 @@ def main():
         raise ValueError(
             "--eval_data_file should be specified when do_eval is true"
         )
-    if args.should_continue:
-        sorted_checkpoints = _sorted_checkpoints(args)
-        if len(sorted_checkpoints) == 0:
-            raise ValueError("--should_continue is true, but no checkpoint found in --output_dir")
+    #if args.should_continue:
+    #    sorted_checkpoints = _sorted_checkpoints(args)
+    #    if len(sorted_checkpoints) == 0:
+    #        raise ValueError("--should_continue is true, but no checkpoint found in --output_dir")
 
     # Setup CUDA, GPU & distributed training
     if args.local_rank == -1 or args.no_cuda:
