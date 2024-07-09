@@ -72,7 +72,10 @@ for dial in data:
             if flag: # model prediction might be correct if found in Type 2 list of noisy annotations
                 dial_name = dial.split('.')[0]
                 if dial_name in IGNORE_TURNS_TYPE2 and turn_id in IGNORE_TURNS_TYPE2[dial_name]: # ignore these turns
-                    pass
+                    # fix: it should be continue, not pass.
+                    #     for not count as `num_turns`
+                    continue
+                    #pass
                 else:
                     joint_acc += 1
                     join_flag = True
