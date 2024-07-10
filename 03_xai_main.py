@@ -254,8 +254,8 @@ def train(args, tokenized_datasets, model, tokenizer):
         adam_epsilon=args.adam_epsilon,
         lr_scheduler_type="linear",
         warmup_steps=args.warmup_steps,
-        bf16=True,
-        bf16_full_eval=True,
+        #bf16=True,                     # it may cause problem with llama + multi-gpu setting
+        #bf16_full_eval=True,
         max_seq_length = args.block_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         eval_on_start = True,
@@ -397,8 +397,8 @@ def main():
     tokenized_datasets = None
     # Training
     if args.do_train:
-        # TODO: support for datasets `shuffling something`
-        #train_dataset = load_and_cache_examples(args, tokenizer, evaluate=False)
+        # old todo: support for datasets `shuffling something`
+        # fix: well, i just shuffle BS. and ACT. in data file beforehand.
         raw_datasets = datasets.load_dataset(
             "text",
             data_files={"train":args.train_data_file,
