@@ -62,6 +62,8 @@ logger.setLevel(logging.DEBUG)
 file_handler = logging.FileHandler('recent.log')
 logger.addHandler(file_handler)
 
+np.random.seed(7777)
+
 MODEL_CLASSES = {
     "gpt2": (GPT2Config, GPT2LMHeadModel, GPT2Tokenizer),
     "gpt2-small": (GPT2SmallConfig, GPT2LMHeadModel, GPT2Tokenizer),
@@ -117,10 +119,12 @@ def get_model_tokenizer(args):
         tokenizer.model_max_length = args.block_size
         args.block_size = min(args.block_size, tokenizer.model_max_length)
         tokenizer.eos_token = "<|end_of_text|>"
-        tokenizer.eos_token_id = tokenizer.encode("<|end_of_text|>", add_special_tokens=False)[0]
+        tokenizer.eos_token_id = tokenizer.encode(tokenizer.eos_token, add_special_tokens=False)[0]
         model.config.eos_token_id = tokenizer.eos_token_id
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.pad_token_id = tokenizer.eos_token_id
+        tokenizer.pad_token = "<|reserved_special_token_0|>"
+        tokenizer.pad_token_id =tokenizer.encode(tokenizer.pad_token, add_special_tokens=False)[0]
+        model.generation_config.eos_token_id = [tokenizer.eos_token_id]
+        model.generation_config.max_length = args.block_size
     else:
         if args.model_name_or_path:
             model = model_class.from_pretrained(
@@ -171,6 +175,7 @@ class CustomCollator(DataCollatorWithPadding):
         return batch
 
 CUSTOM_TRAINER_OUTPUT_DIR = "./"
+CUSTOM_TRAINER_EXAMPLE_TENSOR = None
 class CustomTrainer(SFTTrainer):
     def evaluate(self, *args, **kwargs):
         result = super().evaluate(*args, **kwargs)
@@ -184,6 +189,10 @@ class CustomTrainer(SFTTrainer):
         logger.info(f"")
         for l in self.state.log_history:
             logger.info(f"{l}")
+        if not isinstance(CUSTOM_TRAINER_EXAMPLE_TENSOR, type(None)):
+            logger.info(f"ex_input:\n{self.tokenizer.decode(CUSTOM_TRAINER_EXAMPLE_TENSOR[0])}")
+            example_res = self.model.generate(CUSTOM_TRAINER_EXAMPLE_TENSOR)
+            logger.info(f"ex_output:\n{self.tokenizer.decode(example_res[0])}")
         return result
 
 
@@ -240,13 +249,17 @@ def train(args, tokenized_datasets, model, tokenizer):
         num_train_epochs=args.num_train_epochs,
         per_device_train_batch_size=args.per_gpu_train_batch_size,
         per_device_eval_batch_size=args.per_gpu_eval_batch_size,
-        #bf16=True,
-        #bf16_full_eval=True,
+        learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,
+        adam_epsilon=args.adam_epsilon,
+        lr_scheduler_type="linear",
+        warmup_steps=args.warmup_steps,
+        bf16=True,
+        bf16_full_eval=True,
         max_seq_length = args.block_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
+        eval_on_start = True,
     )
-    # TODO: add arg to argparser for peft config
-    #  - more option for target_modules outta 'last layer'
     linears_last_layer = get_last_layer_linears(model, n=args.num_trained_layers)
     if len(linears_last_layer) == 0:
         linears_last_layer = None
@@ -261,21 +274,6 @@ def train(args, tokenized_datasets, model, tokenizer):
             bias="none",
             task_type="CAUSAL_LM",
         )
-        model = get_peft_model(model, peft_config)
-        lora_layers = filter(lambda p: p.requires_grad, model.parameters())
-
-
-        # Prepare optimizer and schedule (linear warmup and decay)
-        #optimizer, scheduler = get_optimizer_scheduler(args, model, t_total)
-        optimizer = AdamW(
-            lora_layers,
-            lr=args.learning_rate,
-            eps=args.adam_epsilon,
-            weight_decay=args.weight_decay,
-            )
-        scheduler = get_linear_schedule_with_warmup(
-                optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=t_total
-            )
     CUSTOM_TRAINER_OUTPUT_DIR = args.output_dir
     trainer = CustomTrainer(
         model=model,
@@ -284,7 +282,6 @@ def train(args, tokenized_datasets, model, tokenizer):
         train_dataset=tokenized_datasets["train"],
         eval_dataset=tokenized_datasets["eval"],
         tokenizer=tokenizer,
-        optimizers=(optimizer, scheduler),
         peft_config=peft_config,
     )
     train_output = trainer.train(resume_from_checkpoint=args.should_continue)
@@ -346,6 +343,7 @@ def evaluate(args, model, tokenizer, prefix="", tokenized_datasets=None):
 
 
 def main():
+    global CUSTOM_TRAINER_EXAMPLE_TENSOR
     parser = ArgsParser()
     parser.parser.add_argument("--use_lora", action="store_true", help="Training LLM with Low-Rank Adaptation")
     parser.parser.add_argument("--lora_r", type=int, default=8, help="Dimension of adapter in LoRA")
@@ -416,7 +414,10 @@ def main():
         tokenized_datasets = raw_datasets.map(partial(tokenize_fn, tokenizer=tokenizer), batched=True)
         tokenized_datasets = tokenized_datasets.remove_columns(["text"])
         tokenized_datasets.set_format("torch")
-
+        example = tokenized_datasets["eval"][0]["input_ids"].detach()
+        context_end = torch.argwhere(example == 128009)[0]
+        example = example[:context_end+1]
+        CUSTOM_TRAINER_EXAMPLE_TENSOR = example.unsqueeze(0).to("cuda")
         global_step, train_loss = train(args, tokenized_datasets, model, tokenizer)
         logger.info(" global_step = {}, average loss = {}".format(global_step, train_loss))
 
