@@ -11,6 +11,14 @@ import pickle
 import re
 
 from transformers import GPT2Tokenizer, AutoTokenizer
+
+BELIEF_SHUFFLE = True
+ACTION_SHUFFLE = True
+WITH_END_OF_TEXT = True
+
+in_loop_belief_shuffle = None
+in_loop_action_shuffle = None
+
 llama3_tknzer = AutoTokenizer.from_pretrained('meta-llama/meta-llama-3-8B-instruct')
 
 multiwoz_data = json.load(open('resources/multi-woz/lex.json', 'r'))
@@ -18,6 +26,9 @@ save_dir = './resources/llama3'
 os.makedirs(save_dir, exist_ok=True)
 
 for split in ['train', 'val', 'test']:
+    
+    in_loop_belief_shuffle = BELIEF_SHUFFLE if split == "train" else False
+    in_loop_action_shuffle = ACTION_SHUFFLE if split == "train" else False
 
     opt = ArgsParser().parse()
     opt.use_knowledge = True
@@ -101,6 +112,8 @@ for split in ['train', 'val', 'test']:
 
             if len(tmp_bs_new) == 0:
                 tmp_bs_new.append(' ')
+            if in_loop_belief_shuffle:
+                random.shuffle(tmp_bs_new)
 
             #tmp_new = '<|belief|> {} <|endofbelief|>'.format(' , '.join(tmp_bs_new))
             tmp_new = ' , '.join(tmp_bs_new)
@@ -132,6 +145,8 @@ for split in ['train', 'val', 'test']:
                     tmp_act_new.append(' '.join(a))
             if len(tmp_act_new) == 0:
                 tmp_act_new.append(' ')
+            if in_loop_action_shuffle:
+                random.shuffle(tmp_act_new)
 
             #tmp_new = '<|action|> {} <|endofaction|>'.format(' , '.join(tmp_act_new))
             tmp_new = ' , '.join(tmp_act_new)
@@ -165,6 +180,8 @@ for split in ['train', 'val', 'test']:
             if response: messages.append({"role": "response", "content": trg.lower()})
             messages = llama3_tknzer.decode(llama3_tknzer.apply_chat_template(messages))
             messages = re.sub(r"\n", r"\\n", messages)
+            if WITH_END_OF_TEXT:
+                messages += "<|end_of_text|>"
             for_json[key].append(messages)
         file_path = '{}/{}.'.format(save_dir, split)
         suffix = []
@@ -174,6 +191,11 @@ for split in ['train', 'val', 'test']:
         if dbnmatch: suffix += ['dbnmatch']
         if action: suffix += ['action']
         if response: suffix += ['sys_delex']
+        shuf = []
+        if in_loop_belief_shuffle: shuf.append("BS")
+        if in_loop_action_shuffle: shuf.append("ACT")
+        if shuf:
+            suffix += [f"shuffle({'_'.join(shuf)})"]
 
         file_path += '_'.join(suffix)
         with open(file_path, 'wt') as f:
